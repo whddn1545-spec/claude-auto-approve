@@ -261,9 +261,13 @@ import uuid as _uuid
 CMUX_SOCK = os.path.expanduser('~/Library/Application Support/cmux/cmux.sock')
 
 _cmux_inside = bool(os.environ.get('CMUX_SURFACE_ID'))  # cmux 내부에서 실행 중이면 True
+_cmux_access_denied = False  # 한 번 거부되면 이후 시도 생략
 
 def _cmux_rpc(method: str, params: dict, timeout: float = 6.0):
     """cmux Unix socket에 JSON-RPC 요청 → (result_dict, True) 또는 (err_str, False)"""
+    global _cmux_access_denied
+    if _cmux_access_denied:
+        return 'cmux 접근 불가 (백그라운드 프로세스)', False
     import socket as _socket
     req = json.dumps({'id': str(_uuid.uuid4()), 'method': method, 'params': params}) + '\n'
     try:
@@ -282,14 +286,19 @@ def _cmux_rpc(method: str, params: dict, timeout: float = 6.0):
             buf += chunk
         s.close()
         if not buf.strip():
-            if not _cmux_inside:
-                return 'cmux 외부에서 실행 중 - cmux 터미널에서 app.py를 실행해주세요', False
             return '소켓 응답 없음', False
-        # 첫 번째 비어있지 않은 줄 파싱 (응답이 \n으로 시작할 경우 대비)
         line = next((l for l in buf.split(b'\n') if l.strip()), b'')
         if not line:
             return '소켓 응답 파싱 실패 (빈 응답)', False
-        resp = json.loads(line)
+        try:
+            resp = json.loads(line)
+        except Exception:
+            raw = line.decode(errors='replace')
+            if 'Access denied' in raw or 'access denied' in raw.lower():
+                _cmux_access_denied = True
+                log('[cmux] 접근 거부 — cmux 터미널 내에서 직접 실행해야 cmux 세션 감지 가능. iTerm2 + JSONL 모드로 계속 동작합니다.', 'warn')
+                return 'cmux 접근 거부', False
+            return raw[:120], False
         if resp.get('ok'):
             return resp.get('result', {}), True
         return str(resp), False
@@ -306,7 +315,8 @@ def get_cmux_surfaces():
     """cmux tree에서 모든 terminal surface 정보 반환 → [{'ref','title','type'}]"""
     result, ok = _cmux_rpc('system.tree', {'all_windows': True})
     if not ok:
-        log(f'[cmux] tree 실패: {str(result)[:120]}', 'warn')
+        if not _cmux_access_denied:
+            log(f'[cmux] tree 실패: {str(result)[:80]}', 'warn')
         return []
     surfaces = []
     for win in result.get('windows', []):
@@ -1309,7 +1319,7 @@ main{display:grid;grid-template-columns:280px 1fr;gap:14px;padding:14px;height:c
 
 <header>
   <h1>⚡ Claude Auto-Approve</h1>
-  <span class="pill">v1.2</span>
+  <span class="pill">v1.4</span>
   <div class="ml-auto">
     <span class="session-badge" id="session-badge">iTerm2 세션 0개</span>
   </div>
