@@ -807,7 +807,7 @@ def monitor_loop():
         except Exception as e:
             log(f'모니터 루프 오류: {e}', 'error')
 
-        time.sleep(1)  # 정상 동작 시 1초 간격
+        time.sleep(2)  # 2초 간격 — osascript 호출·메모리 점유 절반으로 감소
 
     log('모니터링 루프 종료')
 
@@ -947,7 +947,7 @@ def capture_region_b64():
     try:
         x, y, w, h = region
         img = _grab_screen((x, y, w, h))
-        if img is None:
+        if img is None and not limited:  # rate-limit 중엔 fallback 금지 (메모리 고갈 방지)
             img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
         img.thumbnail((700, 350), Image.LANCZOS)
         buf = io.BytesIO()
