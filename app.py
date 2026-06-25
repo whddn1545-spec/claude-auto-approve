@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Auto-Approve v1.3
+Claude Auto-Approve v1.4
 - [C1 fix] AppleScript 파싱: 고유 구분자(<<<FIELD>>>/<<<REC>>>) 사용
 - [C4 fix] HTTP POST 핸들러 state_lock 추가
 - [M1 fix] continuation 오탐 방지: 마지막 8줄만 검사
@@ -20,6 +20,7 @@ Claude Auto-Approve v1.3
 
 import json
 import os
+import socket
 import threading
 import subprocess
 import time
@@ -32,6 +33,42 @@ from datetime import datetime
 from PIL import Image, ImageGrab, ImageChops
 
 PORT = 17654
+HOST = '0.0.0.0'  # 로컬 네트워크 전체에서 접근 가능
+
+# ─── Slack 설정 ──────────────────────────────────────────────────────
+# 환경변수 또는 아래 직접 입력: export SLACK_WEBHOOK_URL="https://hooks.slack.com/..."
+SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
+_slack_lock = threading.Lock()
+_approval_last_notified = 0  # 마지막 슬랙 알림 시점의 승인 횟수
+
+
+def slack_notify(text: str, emoji: str = '🤖', blocks: list = None):
+    """Slack incoming webhook으로 알림 전송. SLACK_WEBHOOK_URL 미설정 시 무시."""
+    if not SLACK_WEBHOOK_URL:
+        return
+    try:
+        import urllib.request
+        payload: dict = {'text': f'{emoji} *Claude Auto-Approve*\n{text}'}
+        if blocks:
+            payload['blocks'] = blocks
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            SLACK_WEBHOOK_URL, data=data,
+            headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        log(f'[Slack] 알림 실패: {e}', 'warn')
+
+
+def _local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return 'localhost'
 
 # ─── 미리보기 캐시 (Fix: screencapture 과호출 방지) ─────────────────
 _preview_cache: dict = {'b64': None, 'ts': 0.0}
@@ -674,8 +711,14 @@ def monitor_loop():
                             _active_dialogs.discard(sid)  # 승인 즉시 클리어 → 다음 다이얼로그 바로 감지
                         with state_lock:
                             state['approve_count'] += 1
+                            cnt_now = state['approve_count']
                         label = sid.split(':')[0]
-                        log(f'✅ 승인 → {label} (총 {state["approve_count"]}회)', 'ok')
+                        log(f'✅ 승인 → {label} (총 {cnt_now}회)', 'ok')
+                        # 10회마다 슬랙 알림
+                        global _approval_last_notified
+                        if cnt_now % 10 == 0 and cnt_now != _approval_last_notified:
+                            _approval_last_notified = cnt_now
+                            slack_notify(f'✅ 권한 승인 *{cnt_now}회* 완료', '✅')
                     else:
                         log(f'세션 입력 실패: {sid}', 'error')
                         with _active_lock:
@@ -710,7 +753,14 @@ def monitor_loop():
                     if ok:
                         with state_lock:
                             state['stall_count'] += 1
-                        log(f'⏰ 30분 멈춤 감지 → "{resume_cmd}" 전송 (총 {state["stall_count"]}회)', 'warn')
+                            sc = state['stall_count']
+                        log(f'⏰ 30분 멈춤 감지 → "{resume_cmd}" 전송 (총 {sc}회)', 'warn')
+                        ip = _local_ip()
+                        slack_notify(
+                            f'⏰ *30분 멈춤 감지* — 재개 명령 전송 (총 {sc}회)\n'
+                            f'명령: `{resume_cmd}`\n'
+                            f'모바일 제어: http://{ip}:{PORT}/m',
+                            '⏰')
                     else:
                         # Fix 5: 전송 실패 시 stall_sent 해제 → 일정 시간 후 재시도 허용
                         _stall_sent.discard(sid)
@@ -734,8 +784,10 @@ def monitor_loop():
                     from datetime import datetime
                     reset_str = datetime.fromtimestamp(reset_epoch).strftime('%H:%M:%S')
                     log(f'⏳ 세션 한도 감지 — {reset_str}에 자동 재개', 'warn')
+                    slack_notify(f'⏳ *토큰 한도 도달* — `{reset_str}`에 자동 재개\n모바일 제어: http://{_local_ip()}:{PORT}/m', '⏳')
                 else:
                     log('⏳ 세션 한도 감지 — 5시간 후 자동 재개 (리셋 시간 파싱 실패)', 'warn')
+                    slack_notify(f'⏳ *토큰 한도 도달* — 5시간 후 자동 재개\n모바일 제어: http://{_local_ip()}:{PORT}/m', '⏳')
                 threading.Thread(target=auto_wait_loop, args=(reset_epoch, rate_limit_sid), daemon=True).start()
 
             # 종료된 세션 정리 (Fix 10: 보조 dict도 GC)
@@ -779,6 +831,7 @@ def auto_wait_loop(reset_epoch: float = 0, trigger_sid: str = ''):
         return
 
     log('🚀 토큰 초기화 완료 — 재개 명령어 전송', 'ok')
+    slack_notify('🚀 *토큰 초기화 완료* — 작업 재개 중', '🚀')
     time.sleep(3)
 
     with state_lock:
@@ -961,6 +1014,9 @@ class Handler(BaseHTTPRequestHandler):
         if p in ('/', '/index.html'):
             self._html(HTML)
 
+        elif p in ('/m', '/mobile'):
+            self._html(MOBILE_HTML)
+
         elif p == '/api/status':
             # Fix 7: 락 안에서 스냅샷 후 직렬화 (logs 등 동시 쓰기 충돌 방지)
             with state_lock:
@@ -1085,6 +1141,33 @@ class Handler(BaseHTTPRequestHandler):
                 if 'idle_send_timeout' in body:
                     state['idle_send_timeout'] = max(60, int(body['idle_send_timeout']))
             self._json(200, {'ok': True})
+
+        elif p == '/api/send':
+            # 모바일에서 특정 세션에 커스텀 명령 전송
+            cmd = body.get('cmd', '').strip()
+            sid = body.get('sid', '')
+            if not cmd:
+                self._json(400, {'error': 'cmd required'})
+                return
+            sent = 0
+            if sid:
+                targets = [sid]
+            else:
+                with state_lock:
+                    targets = [s for s, c in state['session_config'].items() if c.get('continuation', True)]
+            for target in targets:
+                ok = (write_cmux_session(target, cmd) if target.startswith('cmux:')
+                      else write_iterm2_session(target, cmd))
+                if ok:
+                    sent += 1
+            if not targets:
+                # 폴백: 모든 cmux 세션
+                for s in get_cmux_surfaces():
+                    if write_cmux_session(f'cmux:{s["ref"]}', cmd):
+                        sent += 1
+            log(f'📱 모바일 명령 전송: "{cmd}" → {sent}개 세션', 'ok')
+            slack_notify(f'📱 *모바일 명령 전송*: `{cmd}`', '📱')
+            self._json(200, {'ok': True, 'sent': sent})
 
         elif p == '/api/session-config':
             sid = body.get('sid', '')
@@ -1772,38 +1855,207 @@ pollStatus();
 </html>"""
 
 
+# ─── 모바일 UI ─────────────────────────────────────────────────────────
+MOBILE_HTML = r"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Claude Auto-Approve</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{background:#090912;color:#dde;font-family:-apple-system,sans-serif;padding:16px;max-width:480px;margin:0 auto}
+h1{font-size:18px;font-weight:700;color:#00d4ff;margin-bottom:4px}
+.sub{font-size:12px;color:#444;margin-bottom:20px}
+.card{background:#10101f;border:1px solid #1c1c35;border-radius:12px;padding:16px;margin-bottom:12px}
+.card h2{font-size:11px;font-weight:600;color:#00d4ff;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}
+.row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #1c1c35}
+.row:last-child{border-bottom:none}
+.lbl{font-size:12px;color:#888}
+.val{font-size:14px;font-weight:700}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#333;margin-right:6px}
+.dot.on{background:#00ff88;box-shadow:0 0 6px #00ff8877}
+.dot.warn{background:#f39c12;animation:blink .7s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.btn{display:block;width:100%;padding:14px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:10px;letter-spacing:.3px}
+.btn-green{background:#0d3322;color:#00ff88;border:1px solid #00ff8840}
+.btn-red{background:#33100d;color:#ff7070;border:1px solid #ff707040}
+.btn-blue{background:#0d1833;color:#00d4ff;border:1px solid #00d4ff40}
+.btn-gray{background:#1a1a2e;color:#aaa;border:1px solid #2a2a4a}
+.quick-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+.quick-btn{padding:12px 8px;border:none;border-radius:9px;font-size:13px;font-weight:600;cursor:pointer;background:#1a1a2e;color:#dde;border:1px solid #2a2a4a}
+.quick-btn:active{opacity:.7}
+.inp{width:100%;background:#090912;border:1px solid #1c1c35;border-radius:8px;padding:12px;color:#dde;font-size:14px;outline:none;margin-bottom:8px}
+.inp:focus{border-color:#00d4ff60}
+#log{background:#05050d;border-radius:8px;padding:10px;height:200px;overflow-y:auto;font-family:monospace;font-size:11px;line-height:1.6}
+.l-ok{color:#00e87a}.l-warn{color:#d4930a}.l-error{color:#c0392b}.l-info{color:#3a7}.l-ts{color:#2a2a40}
+.timer{text-align:center;padding:10px;background:#1a0f00;border-radius:8px;margin-bottom:10px;display:none}
+.timer .t{font-size:28px;font-weight:700;color:#f39c12;letter-spacing:3px;font-variant-numeric:tabular-nums}
+.timer .tl{font-size:11px;color:#6a4a00;margin-top:2px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#00d4ff;color:#000;padding:10px 20px;border-radius:20px;font-weight:700;font-size:13px;opacity:0;transition:.3s;pointer-events:none}
+.toast.show{opacity:1}
+</style>
+</head>
+<body>
+<h1>⚡ Claude Auto-Approve</h1>
+<div class="sub" id="sub">모바일 제어 패널</div>
+
+<!-- 상태 -->
+<div class="card">
+  <h2>상태</h2>
+  <div class="row"><span class="lbl"><span class="dot" id="dot"></span>모니터</span><span class="val" id="status">-</span></div>
+  <div class="row"><span class="lbl">권한 승인</span><span class="val" style="color:#00ff88" id="approve">-</span></div>
+  <div class="row"><span class="lbl">이어서 진행</span><span class="val" style="color:#00d4ff" id="cont">-</span></div>
+  <div class="row"><span class="lbl">30분 재개</span><span class="val" style="color:#f39c12" id="stall">-</span></div>
+</div>
+
+<!-- 타이머 -->
+<div class="timer" id="timer-box">
+  <div class="t" id="timer">--:--:--</div>
+  <div class="tl">토큰 초기화까지</div>
+</div>
+
+<!-- 모니터 제어 -->
+<div class="card">
+  <h2>제어</h2>
+  <button class="btn btn-green" id="toggle-btn" onclick="toggleMonitor()">▶  모니터 시작</button>
+</div>
+
+<!-- 빠른 명령 -->
+<div class="card">
+  <h2>빠른 명령</h2>
+  <div class="quick-grid">
+    <button class="quick-btn" onclick="sendCmd('개발 계속해줘')">🔄 계속해줘</button>
+    <button class="quick-btn" onclick="sendCmd('이어서 진행해줘')">▶️ 이어서</button>
+    <button class="quick-btn" onclick="sendCmd('현재 상태 알려줘')">📊 상태확인</button>
+    <button class="quick-btn" onclick="sendCmd('잠깐 멈춰줘')">⏸ 일시정지</button>
+  </div>
+  <input class="inp" id="custom-cmd" placeholder="커스텀 명령 입력..." type="text">
+  <button class="btn btn-blue" onclick="sendCustom()">📨 전송</button>
+</div>
+
+<!-- 로그 -->
+<div class="card">
+  <h2>실시간 로그</h2>
+  <div id="log"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let lastLogLen = 0;
+
+async function poll() {
+  try {
+    const d = await (await fetch('/api/status')).json();
+    const dot = document.getElementById('dot');
+    const status = document.getElementById('status');
+    const btn = document.getElementById('toggle-btn');
+    if (d.monitoring) {
+      dot.className = 'dot on'; status.textContent = '모니터링 중';
+      btn.className = 'btn btn-red'; btn.textContent = '⏹  모니터 중지';
+    } else {
+      dot.className = 'dot'; status.textContent = '대기 중';
+      btn.className = 'btn btn-green'; btn.textContent = '▶  모니터 시작';
+    }
+    if (d.rate_limit_hit && d.rate_limit_countdown) {
+      document.getElementById('timer-box').style.display = 'block';
+      document.getElementById('timer').textContent = d.rate_limit_countdown;
+      dot.className = 'dot warn'; status.textContent = '토큰 한도';
+    } else {
+      document.getElementById('timer-box').style.display = 'none';
+    }
+    document.getElementById('approve').textContent = d.approve_count + '회';
+    document.getElementById('cont').textContent = d.continuation_count + '회';
+    document.getElementById('stall').textContent = (d.stall_count||0) + '회';
+    if (d.logs && d.logs.length !== lastLogLen) {
+      lastLogLen = d.logs.length;
+      const el = document.getElementById('log');
+      el.innerHTML = d.logs.slice(-40).map(l =>
+        `<div><span class="l-ts">[${l.ts}]</span> <span class="l-${l.level||'info'}">${esc(l.msg)}</span></div>`
+      ).join('');
+      el.scrollTop = el.scrollHeight;
+    }
+  } catch(e) {}
+}
+
+async function toggleMonitor() {
+  const r = await (await fetch('/api/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
+  if (r.error) toast(r.error, true);
+}
+
+async function sendCmd(cmd) {
+  const r = await (await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd})})).json();
+  toast(r.ok ? `✅ "${cmd}" 전송 완료` : '전송 실패');
+}
+
+async function sendCustom() {
+  const cmd = document.getElementById('custom-cmd').value.trim();
+  if (!cmd) return;
+  await sendCmd(cmd);
+  document.getElementById('custom-cmd').value = '';
+}
+
+document.getElementById('custom-cmd').addEventListener('keydown', e => {
+  if (e.key === 'Enter') sendCustom();
+});
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function toast(msg, err=false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.background = err ? '#e74c3c' : '#00d4ff';
+  el.style.color = err ? '#fff' : '#000';
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+poll();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>"""
+
+
 # ─── 메인 ──────────────────────────────────────────────────────────────
 def main():
-    cmux_status = f"cmux 내부 ✓ (surface={os.environ.get('CMUX_SURFACE_ID','?')[:8]})" if _cmux_inside else "cmux 외부 ⚠ (Terminal.app에서 실행 중)"
-    print(f"""
-╔═══════════════════════════════════════════╗
-║      Claude Auto-Approve  v1.3            ║
-║  http://localhost:{PORT}  에서 실행        ║
-║  종료: Ctrl+C                             ║
-╚═══════════════════════════════════════════╝
-  cmux: {cmux_status}
-""")
-    if not _cmux_inside and os.path.exists(CMUX_SOCK):
-        print("""
-⚠️  cmux가 실행 중이지만 이 서버가 cmux 외부에서 실행됩니다.
-   cmux 세션 모니터링을 사용하려면:
-   → cmux의 터미널 탭에서 실행하세요: python3 ~/claude-auto-approve/app.py
-""")
+    cmux_status = f"cmux 내부 ✓ (surface={os.environ.get('CMUX_SURFACE_ID','?')[:8]})" if _cmux_inside else "cmux 외부 ⚠"
+    ip = _local_ip()
+    slack_status = '✓ 설정됨' if SLACK_WEBHOOK_URL else '⚠ 미설정 (SLACK_WEBHOOK_URL 환경변수 필요)'
 
-    # 권한 확인
+    if not _cmux_inside and os.path.exists(CMUX_SOCK):
+        print("⚠️  cmux 외부에서 실행 중 — cmux 탭에서 실행하면 세션 모니터링 가능")
+
     _, ok = osascript('tell application "System Events" to get name of first process whose frontmost is true')
     if not ok:
-        print("""
-⚠️  접근성(Accessibility) 권한 필요:
-   시스템 설정 → 개인정보 보호 → 손쉬운 사용 → 터미널 앱 허용
+        print("⚠️  접근성 권한 필요: 시스템 설정 → 개인정보 보호 → 손쉬운 사용 → 터미널 허용")
+
+    print(f"""
+╔══════════════════════════════════════════════════╗
+║       Claude Auto-Approve  v1.4                  ║
+╠══════════════════════════════════════════════════╣
+║  PC      : http://localhost:{PORT}               ║
+║  모바일  : http://{ip}:{PORT}/m                 ║
+║  (같은 WiFi에서 접속)                            ║
+╠══════════════════════════════════════════════════╣
+║  Slack: {slack_status}
+║  cmux : {cmux_status}
+╚══════════════════════════════════════════════════╝
 """)
 
-    server = HTTPServer(('localhost', PORT), Handler)
+    slack_notify(
+        f'🟢 *Claude Auto-Approve 시작*\n모바일 제어: http://{ip}:{PORT}/m',
+        '🟢'
+    )
+
+    server = HTTPServer((HOST, PORT), Handler)
     threading.Thread(target=lambda: (time.sleep(1.2), webbrowser.open(f'http://localhost:{PORT}')), daemon=True).start()
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        slack_notify('🔴 *Claude Auto-Approve 종료*', '🔴')
         print('\n종료됨')
 
 
