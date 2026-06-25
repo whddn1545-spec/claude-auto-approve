@@ -285,7 +285,11 @@ def _cmux_rpc(method: str, params: dict, timeout: float = 6.0):
             if not _cmux_inside:
                 return 'cmux 외부에서 실행 중 - cmux 터미널에서 app.py를 실행해주세요', False
             return '소켓 응답 없음', False
-        resp = json.loads(buf.split(b'\n')[0])
+        # 첫 번째 비어있지 않은 줄 파싱 (응답이 \n으로 시작할 경우 대비)
+        line = next((l for l in buf.split(b'\n') if l.strip()), b'')
+        if not line:
+            return '소켓 응답 파싱 실패 (빈 응답)', False
+        resp = json.loads(line)
         if resp.get('ok'):
             return resp.get('result', {}), True
         return str(resp), False
