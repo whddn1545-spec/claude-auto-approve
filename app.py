@@ -20,6 +20,7 @@ Claude Auto-Approve v1.4
 
 import json
 import os
+import signal
 import socket
 import threading
 import subprocess
@@ -31,6 +32,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime
 from PIL import Image, ImageGrab, ImageChops
+
+# cmux 프로세스 트리 안에 머물기 위해 nohup 없이 실행 가능하도록 SIGHUP 무시
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
 PORT = 17654
 HOST = '0.0.0.0'  # 로컬 네트워크 전체에서 접근 가능
