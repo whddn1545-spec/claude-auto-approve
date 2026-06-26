@@ -80,25 +80,50 @@ _preview_lock = threading.Lock()
 PREVIEW_MIN_INTERVAL = 5  # 최소 5초 간격, rate-limit 중엔 30초
 
 # ─── 전역 상태 ──────────────────────────────────────────────────────
+SETTINGS_FILE = os.path.expanduser('~/claude-auto-approve/settings.json')
+
+def _load_settings() -> dict:
+    try:
+        with open(SETTINGS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_settings():
+    try:
+        with state_lock:
+            data = {k: state[k] for k in (
+                'region', 'autonomous_mode', 'continuation_mode',
+                'resume_cmd', 'continuation_cmd', 'delay_sec',
+                'stall_git', 'idle_send_timeout', 'session_config',
+            )}
+            data['autostart'] = state.get('monitoring', False)
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        pass  # 저장 실패 무시
+
+_saved = _load_settings()
+
 state = {
-    'region': None,
+    'region': _saved.get('region', None),
     'monitoring': False,
-    'autonomous_mode': False,
-    'continuation_mode': True,    # 이어서 진행 자동 응답
+    'autonomous_mode': _saved.get('autonomous_mode', False),
+    'continuation_mode': _saved.get('continuation_mode', True),
     'rate_limit_hit': False,
     'rate_limit_remaining': 0,
     'logs': [],
     'approve_count': 0,
     'continuation_count': 0,
-    'resume_cmd': '개발 계속해줘',
-    'continuation_cmd': '이어서 진행해줘',
-    'delay_sec': 1.0,
+    'resume_cmd': _saved.get('resume_cmd', '개발 계속해줘'),
+    'continuation_cmd': _saved.get('continuation_cmd', '이어서 진행해줘'),
+    'delay_sec': _saved.get('delay_sec', 1.0),
     'last_status': 'idle',
     'active_sessions': 0,
-    'session_config': {},   # {'cmux:surface:24': {'approve': True, 'continuation': True, 'title': '✳ ...'}}
+    'session_config': _saved.get('session_config', {}),
     'stall_count': 0,
-    'stall_git': True,      # stall 감지 시 git commit+push 여부
-    'idle_send_timeout': 10 * 60,  # idle 감지 후 전송까지 대기 시간(초), 기본 10분
+    'stall_git': _saved.get('stall_git', True),
+    'idle_send_timeout': _saved.get('idle_send_timeout', 10 * 60),
 }
 state_lock = threading.Lock()
 
@@ -1116,6 +1141,7 @@ class Handler(BaseHTTPRequestHandler):
                     start = True
                 monitoring = state['monitoring']
             log(*do_log)
+            _save_settings()
             if start:
                 threading.Thread(target=monitor_loop, daemon=True).start()
             self._json(200, {'monitoring': monitoring})
@@ -1126,6 +1152,7 @@ class Handler(BaseHTTPRequestHandler):
                 with state_lock:
                     state['region'] = r
                 log(f'영역 설정: ({r[0]},{r[1]}) {r[2]}×{r[3]}px', 'ok')
+                _save_settings()
                 self._json(200, {'ok': True})
             else:
                 self._json(400, {'error': 'region must be [x,y,w,h]'})
@@ -1501,7 +1528,7 @@ async function pollStatus() {
     document.getElementById('auto-sw').className = 'sw' + (autoOn ? ' on' : '');
     document.getElementById('cont-sw').className = 'sw green' + (contOn ? ' on' : '');
     document.getElementById('stall-git-sw').className = 'sw green' + (stallGitOn ? ' on' : '');
-    document.getElementById('session-badge').textContent = `iTerm2 세션 ${d.active_sessions}개`;
+    document.getElementById('session-badge').textContent = `세션 ${d.active_sessions}개`;
   } catch(e) {}
 }
 
@@ -2069,6 +2096,20 @@ def main():
 
     server = HTTPServer((HOST, PORT), Handler)
     threading.Thread(target=lambda: (time.sleep(1.2), webbrowser.open(f'http://localhost:{PORT}')), daemon=True).start()
+
+    # 저장된 설정에서 자동 재개
+    if _saved.get('autostart') and state.get('region'):
+        def _autostart():
+            time.sleep(2)
+            with state_lock:
+                if not state['monitoring']:
+                    state['monitoring'] = True
+                    state['last_status'] = 'monitoring'
+                    if _saved.get('autonomous_mode'):
+                        state['autonomous_mode'] = True
+            log('설정 복원: 모니터링 자동 재개', 'ok')
+            threading.Thread(target=monitor_loop, daemon=True).start()
+        threading.Thread(target=_autostart, daemon=True).start()
 
     try:
         server.serve_forever()
