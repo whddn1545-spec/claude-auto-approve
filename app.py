@@ -544,6 +544,197 @@ def _get_work_summary(repo_path: str, max_age_hours: int = 8) -> str:
     return ''
 
 
+# ─── 포트폴리오 자동 생성 ──────────────────────────────────────────────
+def _get_session_context(repo_path: str, max_age_hours: int = 8, max_chars: int = 3000) -> str:
+    """해당 레포의 최근 JSONL 세션에서 user/assistant 메시지를 모아 요약 컨텍스트 반환."""
+    projects_dir = os.path.expanduser('~/.claude/projects')
+    encoded = repo_path.replace('/', '-')  # '/Users/foo' → '-Users-foo'
+    session_dir = os.path.join(projects_dir, encoded)
+    if not os.path.isdir(session_dir):
+        return ''
+    cutoff = time.time() - max_age_hours * 3600
+    recent = sorted(
+        [f for f in os.listdir(session_dir) if f.endswith('.jsonl')
+         and os.path.getmtime(os.path.join(session_dir, f)) > cutoff],
+        key=lambda f: os.path.getmtime(os.path.join(session_dir, f)),
+        reverse=True
+    )
+    if not recent:
+        return ''
+
+    def _extract_text(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, dict) and c.get('type') == 'text':
+                    parts.append(c.get('text', ''))
+            return ' '.join(parts)
+        return ''
+
+    chunks = []  # 시간순(오래된→최신)으로 모으기 위해 역순 처리 후 reverse
+    for fname in recent:
+        try:
+            with open(os.path.join(session_dir, fname)) as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            msg = d.get('message', d)
+            role = msg.get('role')
+            if role not in ('user', 'assistant'):
+                continue
+            text = _extract_text(msg.get('content', '')).strip()
+            if text:
+                chunks.append(f'[{role}] {text}')
+        if sum(len(c) for c in chunks) > max_chars * 3:
+            break  # 충분히 모았으면 조기 종료
+
+    if not chunks:
+        return ''
+    # 최신 내용을 우선 보존 → 뒤에서부터 max_chars까지 채우고 시간순 복원
+    selected = []
+    total = 0
+    for c in reversed(chunks):
+        if total + len(c) > max_chars:
+            break
+        selected.append(c)
+        total += len(c)
+    selected.reverse()
+    return '\n'.join(selected)[:max_chars]
+
+
+def _generate_portfolio_entry(repo_path: str, session_context: str) -> str:
+    """Claude API(Opus)로 PM/개발자 관점 포트폴리오 작업 기록 생성. 실패 시 빈 문자열."""
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        log('[portfolio] ANTHROPIC_API_KEY 미설정 — 스킵', 'warn')
+        return ''
+
+    from datetime import datetime
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    system_prompt = (
+        '당신은 개발자 종우(beakjong-woo)의 작업을 정리하는 어시스턴트입니다.\n'
+        '종우가 직접 이 작업을 왜 했는지, 어떤 생각이었는지가 1인칭 시점으로 느껴지도록 작성하세요.\n'
+        '포트폴리오에 올릴 수 있는 수준으로 작성하되, 딱딱하지 않고 개인 의견과 의도가 살아있어야 합니다.'
+    )
+    user_prompt = (
+        f'아래는 방금 작업한 세션의 컨텍스트입니다 (레포: {repo_path}).\n'
+        '이 내용을 바탕으로 포트폴리오용 작업 기록을 아래 마크다운 포맷 그대로 한 개 생성하세요.\n'
+        '코드블록(```)으로 감싸지 말고, 마크다운 본문만 출력하세요.\n\n'
+        '--- 세션 컨텍스트 시작 ---\n'
+        f'{session_context}\n'
+        '--- 세션 컨텍스트 끝 ---\n\n'
+        '출력 포맷:\n'
+        f'## {now_str} — {{한 줄 작업 요약}}\n\n'
+        '### 🎯 왜 이걸 만들었나 (PM/PO/AX 관점)\n'
+        '{이 기능/수정을 하게 된 맥락, 해결하려 한 문제, 사용자 경험 관점, 기획 의도, 개인 생각}\n\n'
+        '### 🔧 어떻게 만들었나 (개발자 관점)\n'
+        '{기술적 구현 방식, 선택한 이유, 트레이드오프, 주의한 점}\n\n'
+        '---'
+    )
+
+    try:
+        import urllib.request, json as _json
+        payload = {
+            'model': 'claude-opus-4-8',
+            'max_tokens': 2000,
+            'thinking': {'type': 'adaptive'},
+            'system': system_prompt,
+            'messages': [{'role': 'user', 'content': user_prompt}],
+        }
+        req = urllib.request.Request(
+            'https://api.anthropic.com/v1/messages',
+            data=_json.dumps(payload).encode(),
+            headers={
+                'x-api-key': api_key,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            }
+        )
+        resp = _json.loads(urllib.request.urlopen(req, timeout=60).read())
+        # content 블록 중 text 타입만 모음 (adaptive thinking 시 thinking 블록은 제외)
+        text = ''.join(
+            b.get('text', '') for b in resp.get('content', [])
+            if isinstance(b, dict) and b.get('type') == 'text'
+        ).strip()
+        return text
+    except Exception as e:
+        log(f'[portfolio] 생성 실패: {e}', 'warn')
+        return ''
+
+
+def _append_to_work_log(repo_path: str, entry: str):
+    """{repo_path}/docs/work-log.md 헤더 다음(맨 앞)에 entry 추가. 최신이 위로."""
+    docs_dir = os.path.join(repo_path, 'docs')
+    os.makedirs(docs_dir, exist_ok=True)
+    log_path = os.path.join(docs_dir, 'work-log.md')
+    header = (
+        '# 작업 기록\n\n'
+        '> Claude Auto-Approve가 자동 생성한 포트폴리오용 작업 로그\n\n'
+    )
+    entry_block = entry.strip() + '\n\n'
+    if os.path.exists(log_path):
+        with open(log_path, encoding='utf-8') as fh:
+            existing = fh.read()
+        marker = '자동 생성한 포트폴리오용 작업 로그'
+        m = existing.find(marker)
+        if m != -1:
+            # 인용구 라인 끝 다음의 빈 줄 뒤에 entry 삽입 (헤더 보존)
+            line_end = existing.find('\n', m)
+            insert_at = existing.find('\n', line_end + 1) if line_end != -1 else -1
+            if insert_at != -1:
+                new_content = (existing[:insert_at + 1].rstrip('\n') + '\n\n'
+                               + entry_block + existing[insert_at + 1:].lstrip('\n'))
+            else:
+                new_content = header + entry_block + existing
+        else:
+            # 헤더가 없는 기존 파일 → 헤더 추가 후 entry, 기존 내용 보존
+            new_content = header + entry_block + existing
+    else:
+        new_content = header + entry_block
+    with open(log_path, 'w', encoding='utf-8') as fh:
+        fh.write(new_content)
+
+
+def _create_portfolio_log(repo_path: str):
+    """세션 컨텍스트 → 포트폴리오 entry 생성 → work-log.md 저장 → 추가 커밋/푸시.
+    실패 시 조용히 스킵 (예외 잡음)."""
+    try:
+        session_context = _get_session_context(repo_path)
+        if not session_context:
+            log('[portfolio] 세션 컨텍스트 없음 — 스킵', 'info')
+            return
+        entry = _generate_portfolio_entry(repo_path, session_context)
+        if not entry:
+            return  # API 미설정/실패 시 이미 로그됨
+        _append_to_work_log(repo_path, entry)
+        log(f'[portfolio] work-log 업데이트: {repo_path}', 'ok')
+        rel = os.path.join('docs', 'work-log.md')
+        subprocess.run(['git', '-C', repo_path, 'add', rel], capture_output=True, timeout=10)
+        r = subprocess.run(
+            ['git', '-C', repo_path, 'commit', '-m', '[Portfolio] work-log 업데이트'],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            log(f'[portfolio] 커밋 완료: {repo_path}', 'ok')
+            pr = subprocess.run(['git', '-C', repo_path, 'push'],
+                                capture_output=True, text=True, timeout=30)
+            if pr.returncode == 0:
+                log(f'[portfolio] 푸시 완료: {repo_path}', 'ok')
+            else:
+                log(f'[portfolio] 푸시 실패: {pr.stderr.strip()[:80]}', 'warn')
+        else:
+            log(f'[portfolio] 커밋 스킵/실패: {r.stderr.strip()[:80]}', 'info')
+    except Exception as e:
+        log(f'[portfolio] 처리 실패: {e}', 'warn')
+
+
 def auto_git_commit_push(repo_path: str):
     """변경사항 add → commit → push. 변경 없으면 스킵."""
     try:
@@ -569,6 +760,8 @@ def auto_git_commit_push(repo_path: str):
             log(f'[git] 푸시 완료: {repo_path}', 'ok')
         else:
             log(f'[git] 푸시 실패: {r.stderr.strip()[:80]}', 'error')
+        # 커밋/푸시 성공 후 포트폴리오 작업 로그 자동 생성 (실패해도 조용히 스킵)
+        _create_portfolio_log(repo_path)
     except Exception as e:
         log(f'[git] 오류 ({repo_path}): {e}', 'error')
 
