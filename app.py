@@ -609,47 +609,81 @@ def _get_session_context(repo_path: str, max_age_hours: int = 8, max_chars: int 
     return '\n'.join(selected)[:max_chars]
 
 
+PORTFOLIO_PENDING_DIR = os.path.expanduser('~/Desktop/claude-portfolio-pending')
+
+
+def _portfolio_notify(title: str, body: str):
+    """알림 전송. Slack 연결 시 Slack, 항상 macOS 시스템 알림 병행."""
+    slack_notify(f'*{title}*\n{body}')
+    safe_title = title.replace('"', '\\"')
+    safe_body = body.replace('"', '\\"')
+    osascript(f'display notification "{safe_body}" with title "{safe_title}"')
+
+
+def _save_to_pending(repo_path: str, draft: str, date_str: str):
+    """API 실패 시 draft를 ~/Desktop/claude-portfolio-pending/ 에 저장."""
+    os.makedirs(PORTFOLIO_PENDING_DIR, exist_ok=True)
+    repo_name = os.path.basename(repo_path)
+    fname = f'{date_str}_{repo_name}.md'
+    fpath = os.path.join(PORTFOLIO_PENDING_DIR, fname)
+    with open(fpath, 'w', encoding='utf-8') as fh:
+        fh.write(f'# Pending: {repo_path}\n# Date: {date_str}\n\n{draft}')
+    log(f'[pending] 저장: {fpath}', 'warn')
+    _portfolio_notify(
+        '📋 포트폴리오 대기 중',
+        f'{repo_name} 작업 기록이 대기 폴더에 저장됐습니다.\n토큰 복구 후 자동 처리됩니다.'
+    )
+
+
 def _call_claude_api(model: str, system: str, user: str,
-                     max_tokens: int = 2000, timeout: int = 90,
-                     retries: int = 3) -> tuple:
-    """재시도 포함 Claude API 호출. (text, None) 또는 ('', error_str) 반환."""
-    import urllib.request as _ureq, json as _json
+                     max_tokens: int = 2000, timeout: int = 90) -> tuple:
+    """Claude API 호출. (text, None) 또는 ('', error_type) 반환.
+    error_type: 'rate_limit' | 'no_key' | 'error:<msg>'
+    429/토큰 한도 → 즉시 rate_limit 반환 (재시도 없음).
+    일반 오류 → 최대 2회 재시도 (10초 간격).
+    """
+    import urllib.request as _ureq, urllib.error as _uerr, json as _json
     api_key = os.environ.get('ANTHROPIC_API_KEY')
     if not api_key:
-        return '', 'ANTHROPIC_API_KEY 미설정'
+        return '', 'no_key'
     payload = {
-        'model': model,
-        'max_tokens': max_tokens,
+        'model': model, 'max_tokens': max_tokens,
         'system': system,
         'messages': [{'role': 'user', 'content': user}],
     }
-    last_err = ''
-    for attempt in range(retries):
+    data = _json.dumps(payload).encode()
+    headers = {
+        'x-api-key': api_key,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+    }
+    for attempt in range(2):
         try:
-            req = _ureq.Request(
-                'https://api.anthropic.com/v1/messages',
-                data=_json.dumps(payload).encode(),
-                headers={
-                    'x-api-key': api_key,
-                    'anthropic-version': '2023-06-01',
-                    'content-type': 'application/json',
-                }
-            )
+            req = _ureq.Request('https://api.anthropic.com/v1/messages',
+                                data=data, headers=headers)
             resp = _json.loads(_ureq.urlopen(req, timeout=timeout).read())
             text = ''.join(
                 b.get('text', '') for b in resp.get('content', [])
                 if isinstance(b, dict) and b.get('type') == 'text'
             ).strip()
-            if text:
-                return text, None
-            last_err = '빈 응답'
+            return (text, None) if text else ('', 'error:빈 응답')
+        except _uerr.HTTPError as e:
+            if e.code == 429 or e.code == 529:
+                return '', 'rate_limit'
+            try:
+                body = _json.loads(e.read())
+                etype = body.get('error', {}).get('type', '')
+                if 'rate_limit' in etype or 'overloaded' in etype:
+                    return '', 'rate_limit'
+            except Exception:
+                pass
+            err_msg = f'HTTP {e.code}'
         except Exception as e:
-            last_err = str(e)[:120]
-            if attempt < retries - 1:
-                wait = 5 * (2 ** attempt)  # 5s → 10s → 20s
-                log(f'[portfolio] API 오류 (시도 {attempt+1}/{retries}, {wait}초 후 재시도): {last_err}', 'warn')
-                time.sleep(wait)
-    return '', last_err
+            err_msg = str(e)[:80]
+        if attempt == 0:
+            log(f'[portfolio] API 오류 ({err_msg}), 10초 후 재시도', 'warn')
+            time.sleep(10)
+    return '', f'error:{err_msg}'
 
 
 def _append_to_work_log(repo_path: str, entry: str):
@@ -686,22 +720,35 @@ def _append_to_work_log(repo_path: str, entry: str):
 
 
 def _create_draft_note(repo_path: str):
-    """30분 stall 시 Sonnet으로 중간 메모 → docs/work-log-draft.md 누적."""
+    """30분 stall 시 중간 메모 → docs/work-log-draft.md 누적.
+    API 미설정/rate_limit → raw context 직접 저장 (토큰 낭비 없음).
+    일반 오류 → Sonnet 1회 시도 후 raw 폴백.
+    """
     try:
         session_context = _get_session_context(repo_path)
         if not session_context:
             return
         from datetime import datetime
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
-        system = '개발 작업 메모를 간결하게 정리하는 어시스턴트입니다. 불필요한 수식 없이 핵심만 작성하세요.'
-        user = (
-            f'다음 세션 컨텍스트를 바탕으로 작업 메모를 작성하세요 (레포: {repo_path}, 시각: {now_str}).\n'
-            f'무엇을 했는지, 왜 했는지 핵심만 3~5문장으로:\n\n{session_context}'
-        )
-        text, err = _call_claude_api('claude-sonnet-4-6', system, user, max_tokens=600, timeout=45, retries=2)
+
+        api_key = os.environ.get('ANTHROPIC_API_KEY')
+        text = ''
+        if api_key:
+            system = '개발 작업 메모를 간결하게 정리하는 어시스턴트입니다. 불필요한 수식 없이 핵심만 작성하세요.'
+            user = (
+                f'다음 세션 컨텍스트를 바탕으로 작업 메모를 작성하세요 (레포: {repo_path}, 시각: {now_str}).\n'
+                f'무엇을 했는지, 왜 했는지 핵심만 3~5문장으로:\n\n{session_context}'
+            )
+            text, err = _call_claude_api('claude-sonnet-4-6', system, user, max_tokens=600, timeout=45)
+            if err == 'rate_limit':
+                log('[draft] 토큰 한도 — API 미호출, raw 저장', 'warn')
+                text = ''
+            elif not text:
+                log(f'[draft] Sonnet 실패 ({err}) — raw 저장', 'warn')
+
         if not text:
-            log(f'[draft] Sonnet 실패 ({err}) — raw context 저장', 'warn')
-            text = f'[raw] {session_context[:400]}'
+            text = f'[raw] {session_context[:500]}'
+
         docs_dir = os.path.join(repo_path, 'docs')
         os.makedirs(docs_dir, exist_ok=True)
         with open(os.path.join(docs_dir, 'work-log-draft.md'), 'a', encoding='utf-8') as fh:
@@ -711,22 +758,7 @@ def _create_draft_note(repo_path: str):
         log(f'[draft] 실패: {e}', 'warn')
 
 
-def _daily_portfolio_for_repo(repo_path: str):
-    """하루치 draft → Opus 정리 → work-log.md 추가 → 커밋/푸시.
-    Opus 실패 시 Sonnet 폴백 → 둘 다 실패 시 raw draft 그대로 저장."""
-    from datetime import datetime
-    date_str = datetime.now().strftime('%Y-%m-%d')
-    draft_path = os.path.join(repo_path, 'docs', 'work-log-draft.md')
-
-    if not os.path.exists(draft_path):
-        log(f'[daily] 드래프트 없음 — 스킵: {repo_path}', 'info')
-        return
-    with open(draft_path, encoding='utf-8') as fh:
-        draft = fh.read().strip()
-    if not draft:
-        log(f'[daily] 드래프트 비어있음 — 스킵: {repo_path}', 'info')
-        return
-
+def _build_portfolio_prompt(repo_path: str, draft: str, date_str: str) -> tuple:
     system = (
         '당신은 개발자 종우(beakjong-woo)의 하루 작업을 정리하는 어시스턴트입니다.\n'
         '종우가 직접 이 작업을 왜 했는지, 어떤 생각이었는지가 1인칭 시점으로 느껴지도록 작성하세요.\n'
@@ -734,48 +766,87 @@ def _daily_portfolio_for_repo(repo_path: str):
         '여러 작업이 있으면 하루의 흐름으로 엮어서 하나의 응집된 기록으로 만드세요.'
     )
     user = (
-        f'아래는 오늘({date_str}) {repo_path} 레포에서 작업한 중간 메모들입니다.\n'
+        f'아래는 {date_str} {repo_path} 레포에서 작업한 중간 메모들입니다.\n'
         '종합해서 포트폴리오용 일일 작업 기록을 아래 마크다운 포맷으로 생성하세요.\n'
         '코드블록(```)으로 감싸지 말고 마크다운 본문만 출력하세요.\n\n'
-        f'--- 오늘 작업 메모 ---\n{draft[:6000]}\n--- 끝 ---\n\n'
+        f'--- 작업 메모 ---\n{draft[:6000]}\n--- 끝 ---\n\n'
         '출력 포맷:\n'
-        f'## {date_str} — {{한 줄로 오늘 작업 요약}}\n\n'
+        f'## {date_str} — {{한 줄로 작업 요약}}\n\n'
         '### 🎯 왜 이걸 만들었나 (PM/PO/AX 관점)\n'
-        '{오늘 작업의 맥락, 해결하려 한 문제, 사용자 경험 관점, 기획 의도, 개인 생각}\n\n'
+        '{작업의 맥락, 해결하려 한 문제, 사용자 경험 관점, 기획 의도, 개인 생각}\n\n'
         '### 🔧 어떻게 만들었나 (개발자 관점)\n'
         '{기술적 구현 방식, 선택한 이유, 트레이드오프, 주의한 점}\n\n'
         '---'
     )
+    return system, user
 
-    entry = ''
-    # 1차: Opus (3회 재시도)
-    text, err = _call_claude_api('claude-opus-4-8', system, user, max_tokens=3000, timeout=120, retries=3)
+
+def _daily_portfolio_for_repo(repo_path: str, draft: str, date_str: str):
+    """draft → Opus 1회 시도 → rate_limit/실패 시 pending 저장.
+    pending이 없을 때만 Sonnet 폴백 (토큰 낭비 방지).
+    """
+    system, user = _build_portfolio_prompt(repo_path, draft, date_str)
+
+    # 1차: Opus
+    text, err = _call_claude_api('claude-opus-4-8', system, user, max_tokens=3000, timeout=120)
     if text:
-        entry = text
-        log(f'[daily] Opus 생성 완료: {repo_path}', 'ok')
-    else:
-        log(f'[daily] Opus 3회 모두 실패 ({err}) — Sonnet 폴백 시도', 'warn')
-        slack_notify(f'⚠️ *일일 포트폴리오 Opus 실패* — Sonnet 폴백 중\n레포: `{repo_path}`\n오류: {err[:80]}', '⚠️')
-        # 2차: Sonnet 폴백 (3회 재시도)
-        text, err = _call_claude_api('claude-sonnet-4-6', system, user, max_tokens=3000, timeout=90, retries=3)
-        if text:
-            entry = text
-            log(f'[daily] Sonnet 폴백 성공: {repo_path}', 'warn')
-            slack_notify(f'⚠️ *Sonnet 폴백으로 포트폴리오 생성 완료*\n레포: `{repo_path}`', '⚠️')
-        else:
-            log(f'[daily] Sonnet도 실패 ({err}) — raw draft 그대로 저장', 'error')
-            slack_notify(f'🚨 *포트폴리오 생성 완전 실패 — raw draft 저장*\n레포: `{repo_path}`\n오류: {err[:80]}', '🚨')
-            entry = f'## {date_str} — [AI 생성 실패 — 원본 메모]\n\n{draft}\n\n---'
+        log(f'[daily] Opus 완료: {repo_path}', 'ok')
+        return text
 
-    _append_to_work_log(repo_path, entry)
+    # Opus 실패 분기
+    if err == 'rate_limit':
+        log(f'[daily] 토큰 한도 — pending 저장 후 종료', 'warn')
+        _save_to_pending(repo_path, draft, date_str)
+        return None
 
-    # draft 보관 후 초기화
-    archive = os.path.join(repo_path, 'docs', f'work-log-draft-{date_str}.md')
-    try:
-        os.rename(draft_path, archive)
-    except Exception:
-        pass
+    # 일반 오류 → Sonnet 1회 폴백
+    log(f'[daily] Opus 실패 ({err}) — Sonnet 1회 폴백', 'warn')
+    _portfolio_notify('⚠️ 포트폴리오 Opus 실패', f'Sonnet으로 재시도 중\n{os.path.basename(repo_path)}')
 
+    text, err = _call_claude_api('claude-sonnet-4-6', system, user, max_tokens=3000, timeout=90)
+    if text:
+        log(f'[daily] Sonnet 폴백 성공: {repo_path}', 'warn')
+        return text
+
+    # Sonnet도 실패 → pending 저장
+    log(f'[daily] Sonnet도 실패 ({err}) — pending 저장', 'error')
+    _save_to_pending(repo_path, draft, date_str)
+    return None
+
+
+def _process_pending_files():
+    """pending 폴더의 밀린 파일 처리. API 성공 시 해당 파일 삭제."""
+    if not os.path.isdir(PORTFOLIO_PENDING_DIR):
+        return
+    files = sorted(f for f in os.listdir(PORTFOLIO_PENDING_DIR) if f.endswith('.md'))
+    if not files:
+        return
+    log(f'[pending] 밀린 파일 {len(files)}개 처리 시작', 'ok')
+    for fname in files:
+        fpath = os.path.join(PORTFOLIO_PENDING_DIR, fname)
+        try:
+            with open(fpath, encoding='utf-8') as fh:
+                content = fh.read()
+            # 헤더에서 repo_path, date 파싱
+            lines = content.splitlines()
+            repo_path = lines[0].replace('# Pending: ', '').strip() if lines else ''
+            date_str = lines[1].replace('# Date: ', '').strip() if len(lines) > 1 else ''
+            draft = '\n'.join(lines[3:]).strip()
+            if not repo_path or not draft:
+                continue
+            entry = _daily_portfolio_for_repo(repo_path, draft, date_str)
+            if entry:
+                _append_to_work_log(repo_path, entry)
+                os.remove(fpath)
+                log(f'[pending] 처리 완료: {fname}', 'ok')
+                _portfolio_notify('✅ 밀린 포트폴리오 처리 완료', fname)
+                _commit_portfolio(repo_path, date_str)
+        except Exception as e:
+            log(f'[pending] 처리 실패 ({fname}): {e}', 'error')
+
+
+def _commit_portfolio(repo_path: str, date_str: str):
+    """docs/work-log.md 커밋 & 푸시."""
     subprocess.run(['git', '-C', repo_path, 'add', 'docs/'], capture_output=True, timeout=10)
     r = subprocess.run(
         ['git', '-C', repo_path, 'commit', '-m', f'[Portfolio] {date_str} 일일 작업 기록'],
@@ -784,7 +855,7 @@ def _daily_portfolio_for_repo(repo_path: str):
         pr = subprocess.run(['git', '-C', repo_path, 'push'], capture_output=True, text=True, timeout=30)
         if pr.returncode == 0:
             log(f'[daily] 푸시 완료: {repo_path}', 'ok')
-            slack_notify(f'📔 *{date_str} 포트폴리오 기록 완료*\n레포: `{repo_path}`', '📔')
+            _portfolio_notify('📔 포트폴리오 기록 완료', f'{date_str} {os.path.basename(repo_path)}')
         else:
             log(f'[daily] 푸시 실패: {pr.stderr.strip()[:80]}', 'error')
     else:
@@ -792,14 +863,37 @@ def _daily_portfolio_for_repo(repo_path: str):
 
 
 def run_daily_portfolio():
-    """최근 24시간 내 활성 레포 전체에 대해 일일 포트폴리오 생성."""
+    """매일 밤 실행: pending 먼저 처리 → 오늘 draft 정리."""
+    from datetime import datetime
+    date_str = datetime.now().strftime('%Y-%m-%d')
+
+    # 1. 밀린 pending 파일 먼저 처리
+    _process_pending_files()
+
+    # 2. 오늘 draft 처리
     repos = _find_active_git_repos(max_age_hours=24)
     if not repos:
         log('[daily] 활성 레포 없음', 'info')
         return
     log(f'[daily] 포트폴리오 생성 시작 ({len(repos)}개 레포)', 'ok')
     for repo in repos:
-        threading.Thread(target=_daily_portfolio_for_repo, args=(repo,), daemon=True).start()
+        draft_path = os.path.join(repo, 'docs', 'work-log-draft.md')
+        if not os.path.exists(draft_path):
+            continue
+        with open(draft_path, encoding='utf-8') as fh:
+            draft = fh.read().strip()
+        if not draft:
+            continue
+        entry = _daily_portfolio_for_repo(repo, draft, date_str)
+        if entry:
+            _append_to_work_log(repo, entry)
+            # draft 보관 후 초기화
+            archive = os.path.join(repo, 'docs', f'work-log-draft-{date_str}.md')
+            try:
+                os.rename(draft_path, archive)
+            except Exception:
+                pass
+            _commit_portfolio(repo, date_str)
 
 
 # 1시간마다 자동 git commit/push
