@@ -1612,16 +1612,37 @@ async function toggleStallGit() {
 
 // ── 세션 관리 ──────────────────────────────────────────────────────
 let _sessions = [];
+let _pendingSids = new Set(); // POST 중인 세션 — refresh가 덮어쓰지 않도록 보호
 
 async function refreshSessions() {
   try {
     const d = await (await fetch('/api/sessions')).json();
-    _sessions = d.sessions || [];
-    renderSessions();
+    _mergeSessions(d.sessions || []);
   } catch(e) {}
 }
 
-function renderSessions() {
+function _mergeSessions(fresh) {
+  const oldMap = new Map(_sessions.map(s => [s.sid, s]));
+  let changed = _sessions.length !== fresh.length;
+
+  const next = fresh.map(s => {
+    const old = oldMap.get(s.sid);
+    // POST 전송 중인 세션은 로컬 값 유지
+    if (_pendingSids.has(s.sid) && old) {
+      return { ...s, approve: old.approve, continuation: old.continuation };
+    }
+    if (!old || old.approve !== s.approve || old.continuation !== s.continuation || old.title !== s.title) {
+      changed = true;
+    }
+    return s;
+  });
+
+  if (!changed) return; // 변화 없으면 리렌더 스킵
+  _sessions = next;
+  _renderSessions();
+}
+
+function _renderSessions() {
   const el = document.getElementById('sess-list');
   if (!_sessions.length) {
     el.innerHTML = '<div style="color:#333;font-size:11px;text-align:center;padding:12px">세션 없음</div>';
@@ -1646,23 +1667,38 @@ function renderSessions() {
     </div>`).join('');
 }
 
+// 버튼용 — 강제 전체 재렌더
+function renderSessions() { _renderSessions(); }
+
 async function toggleSessApprove(i) {
-  _sessions[i].approve = !_sessions[i].approve;
-  renderSessions();
-  await fetch('/api/session-config',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({sid:_sessions[i].sid, approve:_sessions[i].approve})});
+  const s = _sessions[i];
+  s.approve = !s.approve;
+  _pendingSids.add(s.sid);
+  _renderSessions();
+  try {
+    await fetch('/api/session-config', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({sid: s.sid, approve: s.approve})});
+  } finally {
+    _pendingSids.delete(s.sid);
+  }
 }
 
 async function toggleSessCont(i) {
-  _sessions[i].continuation = !_sessions[i].continuation;
-  renderSessions();
-  await fetch('/api/session-config',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({sid:_sessions[i].sid, continuation:_sessions[i].continuation})});
+  const s = _sessions[i];
+  s.continuation = !s.continuation;
+  _pendingSids.add(s.sid);
+  _renderSessions();
+  try {
+    await fetch('/api/session-config', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({sid: s.sid, continuation: s.continuation})});
+  } finally {
+    _pendingSids.delete(s.sid);
+  }
 }
 
-// 최초 로드 시 세션 목록 가져오기
+// 최초 로드 + 2초마다 자동 갱신 (status poll과 동일 주기)
 refreshSessions();
-setInterval(refreshSessions, 5000);
+setInterval(refreshSessions, 2000);
 
 async function saveSettings() {
   const body = {
