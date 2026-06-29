@@ -609,65 +609,47 @@ def _get_session_context(repo_path: str, max_age_hours: int = 8, max_chars: int 
     return '\n'.join(selected)[:max_chars]
 
 
-def _generate_portfolio_entry(repo_path: str, session_context: str) -> str:
-    """Claude API(Opus)로 PM/개발자 관점 포트폴리오 작업 기록 생성. 실패 시 빈 문자열."""
+def _call_claude_api(model: str, system: str, user: str,
+                     max_tokens: int = 2000, timeout: int = 90,
+                     retries: int = 3) -> tuple:
+    """재시도 포함 Claude API 호출. (text, None) 또는 ('', error_str) 반환."""
+    import urllib.request as _ureq, json as _json
     api_key = os.environ.get('ANTHROPIC_API_KEY')
     if not api_key:
-        log('[portfolio] ANTHROPIC_API_KEY 미설정 — 스킵', 'warn')
-        return ''
-
-    from datetime import datetime
-    now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
-
-    system_prompt = (
-        '당신은 개발자 종우(beakjong-woo)의 작업을 정리하는 어시스턴트입니다.\n'
-        '종우가 직접 이 작업을 왜 했는지, 어떤 생각이었는지가 1인칭 시점으로 느껴지도록 작성하세요.\n'
-        '포트폴리오에 올릴 수 있는 수준으로 작성하되, 딱딱하지 않고 개인 의견과 의도가 살아있어야 합니다.'
-    )
-    user_prompt = (
-        f'아래는 방금 작업한 세션의 컨텍스트입니다 (레포: {repo_path}).\n'
-        '이 내용을 바탕으로 포트폴리오용 작업 기록을 아래 마크다운 포맷 그대로 한 개 생성하세요.\n'
-        '코드블록(```)으로 감싸지 말고, 마크다운 본문만 출력하세요.\n\n'
-        '--- 세션 컨텍스트 시작 ---\n'
-        f'{session_context}\n'
-        '--- 세션 컨텍스트 끝 ---\n\n'
-        '출력 포맷:\n'
-        f'## {now_str} — {{한 줄 작업 요약}}\n\n'
-        '### 🎯 왜 이걸 만들었나 (PM/PO/AX 관점)\n'
-        '{이 기능/수정을 하게 된 맥락, 해결하려 한 문제, 사용자 경험 관점, 기획 의도, 개인 생각}\n\n'
-        '### 🔧 어떻게 만들었나 (개발자 관점)\n'
-        '{기술적 구현 방식, 선택한 이유, 트레이드오프, 주의한 점}\n\n'
-        '---'
-    )
-
-    try:
-        import urllib.request, json as _json
-        payload = {
-            'model': 'claude-opus-4-8',
-            'max_tokens': 2000,
-            'thinking': {'type': 'adaptive'},
-            'system': system_prompt,
-            'messages': [{'role': 'user', 'content': user_prompt}],
-        }
-        req = urllib.request.Request(
-            'https://api.anthropic.com/v1/messages',
-            data=_json.dumps(payload).encode(),
-            headers={
-                'x-api-key': api_key,
-                'anthropic-version': '2023-06-01',
-                'content-type': 'application/json',
-            }
-        )
-        resp = _json.loads(urllib.request.urlopen(req, timeout=60).read())
-        # content 블록 중 text 타입만 모음 (adaptive thinking 시 thinking 블록은 제외)
-        text = ''.join(
-            b.get('text', '') for b in resp.get('content', [])
-            if isinstance(b, dict) and b.get('type') == 'text'
-        ).strip()
-        return text
-    except Exception as e:
-        log(f'[portfolio] 생성 실패: {e}', 'warn')
-        return ''
+        return '', 'ANTHROPIC_API_KEY 미설정'
+    payload = {
+        'model': model,
+        'max_tokens': max_tokens,
+        'system': system,
+        'messages': [{'role': 'user', 'content': user}],
+    }
+    last_err = ''
+    for attempt in range(retries):
+        try:
+            req = _ureq.Request(
+                'https://api.anthropic.com/v1/messages',
+                data=_json.dumps(payload).encode(),
+                headers={
+                    'x-api-key': api_key,
+                    'anthropic-version': '2023-06-01',
+                    'content-type': 'application/json',
+                }
+            )
+            resp = _json.loads(_ureq.urlopen(req, timeout=timeout).read())
+            text = ''.join(
+                b.get('text', '') for b in resp.get('content', [])
+                if isinstance(b, dict) and b.get('type') == 'text'
+            ).strip()
+            if text:
+                return text, None
+            last_err = '빈 응답'
+        except Exception as e:
+            last_err = str(e)[:120]
+            if attempt < retries - 1:
+                wait = 5 * (2 ** attempt)  # 5s → 10s → 20s
+                log(f'[portfolio] API 오류 (시도 {attempt+1}/{retries}, {wait}초 후 재시도): {last_err}', 'warn')
+                time.sleep(wait)
+    return '', last_err
 
 
 def _append_to_work_log(repo_path: str, entry: str):
@@ -703,36 +685,138 @@ def _append_to_work_log(repo_path: str, entry: str):
         fh.write(new_content)
 
 
-def _create_portfolio_log(repo_path: str):
-    """세션 컨텍스트 → 포트폴리오 entry 생성 → work-log.md 저장 → 추가 커밋/푸시.
-    실패 시 조용히 스킵 (예외 잡음)."""
+def _create_draft_note(repo_path: str):
+    """30분 stall 시 Sonnet으로 중간 메모 → docs/work-log-draft.md 누적."""
     try:
         session_context = _get_session_context(repo_path)
         if not session_context:
-            log('[portfolio] 세션 컨텍스트 없음 — 스킵', 'info')
             return
-        entry = _generate_portfolio_entry(repo_path, session_context)
-        if not entry:
-            return  # API 미설정/실패 시 이미 로그됨
-        _append_to_work_log(repo_path, entry)
-        log(f'[portfolio] work-log 업데이트: {repo_path}', 'ok')
-        rel = os.path.join('docs', 'work-log.md')
-        subprocess.run(['git', '-C', repo_path, 'add', rel], capture_output=True, timeout=10)
-        r = subprocess.run(
-            ['git', '-C', repo_path, 'commit', '-m', '[Portfolio] work-log 업데이트'],
-            capture_output=True, text=True, timeout=15)
-        if r.returncode == 0:
-            log(f'[portfolio] 커밋 완료: {repo_path}', 'ok')
-            pr = subprocess.run(['git', '-C', repo_path, 'push'],
-                                capture_output=True, text=True, timeout=30)
-            if pr.returncode == 0:
-                log(f'[portfolio] 푸시 완료: {repo_path}', 'ok')
-            else:
-                log(f'[portfolio] 푸시 실패: {pr.stderr.strip()[:80]}', 'warn')
-        else:
-            log(f'[portfolio] 커밋 스킵/실패: {r.stderr.strip()[:80]}', 'info')
+        from datetime import datetime
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+        system = '개발 작업 메모를 간결하게 정리하는 어시스턴트입니다. 불필요한 수식 없이 핵심만 작성하세요.'
+        user = (
+            f'다음 세션 컨텍스트를 바탕으로 작업 메모를 작성하세요 (레포: {repo_path}, 시각: {now_str}).\n'
+            f'무엇을 했는지, 왜 했는지 핵심만 3~5문장으로:\n\n{session_context}'
+        )
+        text, err = _call_claude_api('claude-sonnet-4-6', system, user, max_tokens=600, timeout=45, retries=2)
+        if not text:
+            log(f'[draft] Sonnet 실패 ({err}) — raw context 저장', 'warn')
+            text = f'[raw] {session_context[:400]}'
+        docs_dir = os.path.join(repo_path, 'docs')
+        os.makedirs(docs_dir, exist_ok=True)
+        with open(os.path.join(docs_dir, 'work-log-draft.md'), 'a', encoding='utf-8') as fh:
+            fh.write(f'\n### {now_str}\n{text}\n')
+        log(f'[draft] 중간 메모 저장: {repo_path}', 'ok')
     except Exception as e:
-        log(f'[portfolio] 처리 실패: {e}', 'warn')
+        log(f'[draft] 실패: {e}', 'warn')
+
+
+def _daily_portfolio_for_repo(repo_path: str):
+    """하루치 draft → Opus 정리 → work-log.md 추가 → 커밋/푸시.
+    Opus 실패 시 Sonnet 폴백 → 둘 다 실패 시 raw draft 그대로 저장."""
+    from datetime import datetime
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    draft_path = os.path.join(repo_path, 'docs', 'work-log-draft.md')
+
+    if not os.path.exists(draft_path):
+        log(f'[daily] 드래프트 없음 — 스킵: {repo_path}', 'info')
+        return
+    with open(draft_path, encoding='utf-8') as fh:
+        draft = fh.read().strip()
+    if not draft:
+        log(f'[daily] 드래프트 비어있음 — 스킵: {repo_path}', 'info')
+        return
+
+    system = (
+        '당신은 개발자 종우(beakjong-woo)의 하루 작업을 정리하는 어시스턴트입니다.\n'
+        '종우가 직접 이 작업을 왜 했는지, 어떤 생각이었는지가 1인칭 시점으로 느껴지도록 작성하세요.\n'
+        '포트폴리오에 올릴 수 있는 수준으로 작성하되, 딱딱하지 않고 개인 의견과 의도가 살아있어야 합니다.\n'
+        '여러 작업이 있으면 하루의 흐름으로 엮어서 하나의 응집된 기록으로 만드세요.'
+    )
+    user = (
+        f'아래는 오늘({date_str}) {repo_path} 레포에서 작업한 중간 메모들입니다.\n'
+        '종합해서 포트폴리오용 일일 작업 기록을 아래 마크다운 포맷으로 생성하세요.\n'
+        '코드블록(```)으로 감싸지 말고 마크다운 본문만 출력하세요.\n\n'
+        f'--- 오늘 작업 메모 ---\n{draft[:6000]}\n--- 끝 ---\n\n'
+        '출력 포맷:\n'
+        f'## {date_str} — {{한 줄로 오늘 작업 요약}}\n\n'
+        '### 🎯 왜 이걸 만들었나 (PM/PO/AX 관점)\n'
+        '{오늘 작업의 맥락, 해결하려 한 문제, 사용자 경험 관점, 기획 의도, 개인 생각}\n\n'
+        '### 🔧 어떻게 만들었나 (개발자 관점)\n'
+        '{기술적 구현 방식, 선택한 이유, 트레이드오프, 주의한 점}\n\n'
+        '---'
+    )
+
+    entry = ''
+    # 1차: Opus (3회 재시도)
+    text, err = _call_claude_api('claude-opus-4-8', system, user, max_tokens=3000, timeout=120, retries=3)
+    if text:
+        entry = text
+        log(f'[daily] Opus 생성 완료: {repo_path}', 'ok')
+    else:
+        log(f'[daily] Opus 3회 모두 실패 ({err}) — Sonnet 폴백 시도', 'warn')
+        slack_notify(f'⚠️ *일일 포트폴리오 Opus 실패* — Sonnet 폴백 중\n레포: `{repo_path}`\n오류: {err[:80]}', '⚠️')
+        # 2차: Sonnet 폴백 (3회 재시도)
+        text, err = _call_claude_api('claude-sonnet-4-6', system, user, max_tokens=3000, timeout=90, retries=3)
+        if text:
+            entry = text
+            log(f'[daily] Sonnet 폴백 성공: {repo_path}', 'warn')
+            slack_notify(f'⚠️ *Sonnet 폴백으로 포트폴리오 생성 완료*\n레포: `{repo_path}`', '⚠️')
+        else:
+            log(f'[daily] Sonnet도 실패 ({err}) — raw draft 그대로 저장', 'error')
+            slack_notify(f'🚨 *포트폴리오 생성 완전 실패 — raw draft 저장*\n레포: `{repo_path}`\n오류: {err[:80]}', '🚨')
+            entry = f'## {date_str} — [AI 생성 실패 — 원본 메모]\n\n{draft}\n\n---'
+
+    _append_to_work_log(repo_path, entry)
+
+    # draft 보관 후 초기화
+    archive = os.path.join(repo_path, 'docs', f'work-log-draft-{date_str}.md')
+    try:
+        os.rename(draft_path, archive)
+    except Exception:
+        pass
+
+    subprocess.run(['git', '-C', repo_path, 'add', 'docs/'], capture_output=True, timeout=10)
+    r = subprocess.run(
+        ['git', '-C', repo_path, 'commit', '-m', f'[Portfolio] {date_str} 일일 작업 기록'],
+        capture_output=True, text=True, timeout=15)
+    if r.returncode == 0:
+        pr = subprocess.run(['git', '-C', repo_path, 'push'], capture_output=True, text=True, timeout=30)
+        if pr.returncode == 0:
+            log(f'[daily] 푸시 완료: {repo_path}', 'ok')
+            slack_notify(f'📔 *{date_str} 포트폴리오 기록 완료*\n레포: `{repo_path}`', '📔')
+        else:
+            log(f'[daily] 푸시 실패: {pr.stderr.strip()[:80]}', 'error')
+    else:
+        log(f'[daily] 커밋 실패: {r.stderr.strip()[:80]}', 'error')
+
+
+def run_daily_portfolio():
+    """최근 24시간 내 활성 레포 전체에 대해 일일 포트폴리오 생성."""
+    repos = _find_active_git_repos(max_age_hours=24)
+    if not repos:
+        log('[daily] 활성 레포 없음', 'info')
+        return
+    log(f'[daily] 포트폴리오 생성 시작 ({len(repos)}개 레포)', 'ok')
+    for repo in repos:
+        threading.Thread(target=_daily_portfolio_for_repo, args=(repo,), daemon=True).start()
+
+
+# 1시간마다 자동 git commit/push
+_last_hourly_push: float = 0.0
+
+def _hourly_git_push_loop():
+    """1시간마다 활성 레포에 변경사항 자동 커밋/푸시."""
+    global _last_hourly_push
+    while True:
+        time.sleep(3600)
+        if not state.get('monitoring'):
+            continue
+        repos = _find_active_git_repos(max_age_hours=2)
+        for repo in repos:
+            threading.Thread(target=auto_git_commit_push, args=(repo,), daemon=True).start()
+        _last_hourly_push = time.time()
+        log(f'[hourly] 자동 커밋/푸시 실행 ({len(repos)}개 레포)', 'ok')
 
 
 def auto_git_commit_push(repo_path: str):
@@ -760,8 +844,8 @@ def auto_git_commit_push(repo_path: str):
             log(f'[git] 푸시 완료: {repo_path}', 'ok')
         else:
             log(f'[git] 푸시 실패: {r.stderr.strip()[:80]}', 'error')
-        # 커밋/푸시 성공 후 포트폴리오 작업 로그 자동 생성 (실패해도 조용히 스킵)
-        _create_portfolio_log(repo_path)
+        # 커밋/푸시 성공 후 Sonnet 중간 메모 저장 (draft 누적)
+        threading.Thread(target=_create_draft_note, args=(repo_path,), daemon=True).start()
     except Exception as e:
         log(f'[git] 오류 ({repo_path}): {e}', 'error')
 
@@ -1406,6 +1490,10 @@ class Handler(BaseHTTPRequestHandler):
             log(f'📱 모바일 명령 전송: "{cmd}" → {sent}개 세션', 'ok')
             slack_notify(f'📱 *모바일 명령 전송*: `{cmd}`', '📱')
             self._json(200, {'ok': True, 'sent': sent})
+
+        elif p == '/api/daily-portfolio':
+            threading.Thread(target=run_daily_portfolio, daemon=True).start()
+            self._json(200, {'ok': True, 'msg': '일일 포트폴리오 생성 시작'})
 
         elif p == '/api/session-config':
             sid = body.get('sid', '')
@@ -2325,6 +2413,7 @@ def main():
 
     server = HTTPServer((HOST, PORT), Handler)
     threading.Thread(target=lambda: (time.sleep(1.2), webbrowser.open(f'http://localhost:{PORT}')), daemon=True).start()
+    threading.Thread(target=_hourly_git_push_loop, daemon=True).start()
 
     # 저장된 설정에서 자동 재개
     if _saved.get('autostart') and state.get('region'):
