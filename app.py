@@ -28,7 +28,7 @@ import time
 import base64
 import io
 import webbrowser
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime
 from PIL import Image, ImageGrab, ImageChops
@@ -112,6 +112,8 @@ state = {
     'continuation_mode': _saved.get('continuation_mode', True),
     'rate_limit_hit': False,
     'rate_limit_remaining': 0,
+    'rate_limit_hit_gemini': False,
+    'rate_limit_remaining_gemini': 0,
     'logs': [],
     'approve_count': 0,
     'continuation_count': 0,
@@ -146,6 +148,10 @@ DIALOG_PATTERNS = [
     'write to',
     'create file',
     'yes, and',
+    # Gemini(Antigravity) 전용 UI: "❯" 대신 ">"와 "Question N/M:" 포맷을 씀
+    '↑/↓ navigate',
+    'enter select',
+    'write-in...',
 ]
 
 CONTINUATION_PATTERNS = [
@@ -197,8 +203,8 @@ _dialog_last_sent: dict[str, float] = {}
 DIALOG_COOLDOWN = 4.0  # 승인 후 4초간 재승인 억제
 
 
-# 자율모드 재개 후 rate-limit 재감지 억제 (M5)
-_resume_grace_until: float = 0.0
+# 자율모드 재개 후 rate-limit 재감지 억제 (M5) — Claude/Gemini(Antigravity)는 토큰이 별개라 따로 추적
+_resume_grace_until: dict = {'claude': 0.0, 'gemini': 0.0}
 
 # 30분 멈춤 감지: 터미널 내용이 변하지 않으면 stall로 판단
 _content_hash: dict[str, str] = {}
@@ -237,6 +243,9 @@ def get_iterm2_sessions():
     C1 fix: 리스트 대신 문자열 concatenation으로 반환 → ', ' split 파싱 버그 제거.
     """
     script = f'''
+tell application "System Events"
+    if not (exists process "iTerm2") then return ""
+end tell
 set out to ""
 tell application "iTerm2"
     repeat with w in windows
@@ -267,6 +276,9 @@ def write_iterm2_session(session_id, text):
     """특정 iTerm2 세션에 텍스트 + Enter 전송"""
     safe = text.replace('\\', '\\\\').replace('"', '\\"')
     script = f'''
+tell application "System Events"
+    if not (exists process "iTerm2") then return "no-iterm"
+end tell
 tell application "iTerm2"
     repeat with w in windows
         repeat with t in tabs of w
@@ -280,23 +292,36 @@ tell application "iTerm2"
     end repeat
 end tell
 '''
-    _, ok = osascript(script, timeout=6)
-    return ok
+    out, ok = osascript(script, timeout=6)
+    return ok and out == 'ok'
 
 
 # ─── cmux 직접 소켓 통신 (JSON-RPC) ──────────────────────────────────
 import uuid as _uuid
 
 CMUX_SOCK = os.path.expanduser('~/Library/Application Support/cmux/cmux.sock')
+CMUX_CLI = os.environ.get('CMUX_BUNDLED_CLI_PATH', '/Applications/cmux.app/Contents/Resources/bin/cmux')
 
 _cmux_inside = bool(os.environ.get('CMUX_SURFACE_ID'))  # cmux 내부에서 실행 중이면 True
-_cmux_access_denied = False  # 한 번 거부되면 이후 시도 생략
+_cmux_use_cli = False       # 소켓 인증 거부 시 번들 CLI(`cmux rpc`) 경유로 전환
+_cmux_unavailable = False   # 소켓도 CLI도 불가 — 이후 시도 생략
 
-def _cmux_rpc(method: str, params: dict, timeout: float = 6.0):
-    """cmux Unix socket에 JSON-RPC 요청 → (result_dict, True) 또는 (err_str, False)"""
-    global _cmux_access_denied
-    if _cmux_access_denied:
-        return 'cmux 접근 불가 (백그라운드 프로세스)', False
+def _cmux_rpc_cli(method: str, params: dict, timeout: float = 6.0):
+    """번들 CLI `cmux rpc <method> <json>` 경유 호출.
+    cmux에 소켓 비밀번호가 설정된 경우 CLI가 저장된 비밀번호로 인증해준다."""
+    try:
+        r = subprocess.run([CMUX_CLI, 'rpc', method, json.dumps(params)],
+                           capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return (r.stderr or r.stdout).strip()[:120], False
+        out = r.stdout.strip()
+        return (json.loads(out) if out else {}), True
+    except Exception as e:
+        return str(e), False
+
+
+def _cmux_rpc_socket(method: str, params: dict, timeout: float = 6.0):
+    """cmux Unix socket에 JSON-RPC 직접 요청 → (result_dict, True) 또는 (err_str, False)"""
     import socket as _socket
     req = json.dumps({'id': str(_uuid.uuid4()), 'method': method, 'params': params}) + '\n'
     try:
@@ -324,15 +349,32 @@ def _cmux_rpc(method: str, params: dict, timeout: float = 6.0):
         except Exception:
             raw = line.decode(errors='replace')
             if 'Access denied' in raw or 'access denied' in raw.lower():
-                _cmux_access_denied = True
-                log('[cmux] 접근 거부 — cmux 터미널 내에서 직접 실행해야 cmux 세션 감지 가능. iTerm2 + JSONL 모드로 계속 동작합니다.', 'warn')
-                return 'cmux 접근 거부', False
+                return 'access-denied', False
             return raw[:120], False
         if resp.get('ok'):
             return resp.get('result', {}), True
         return str(resp), False
     except Exception as e:
         return str(e), False
+
+
+def _cmux_rpc(method: str, params: dict, timeout: float = 6.0):
+    """cmux RPC: 직접 소켓 → 인증 거부 시 번들 CLI 폴백."""
+    global _cmux_use_cli, _cmux_unavailable
+    if _cmux_unavailable:
+        return 'cmux 접근 불가', False
+    if _cmux_use_cli:
+        return _cmux_rpc_cli(method, params, timeout)
+    result, ok = _cmux_rpc_socket(method, params, timeout)
+    if not ok and result == 'access-denied':
+        if os.path.exists(CMUX_CLI):
+            _cmux_use_cli = True
+            log('[cmux] 소켓 인증 거부 — 번들 CLI(rpc) 경유 모드로 전환', 'warn')
+            return _cmux_rpc_cli(method, params, timeout)
+        _cmux_unavailable = True
+        log('[cmux] 접근 거부 + CLI 없음 — cmux 세션 감지 비활성화. iTerm2 모드로 계속 동작합니다.', 'warn')
+        return 'cmux 접근 거부', False
+    return result, ok
 
 _SPINNER = set('✳⠁⠂⠃⠄⠅⠆⠇⠈⠉⠊⠋⠌⠍⠎⠏⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿⡿⢿⣻⣯⣷⣾⣽⣟⣿⣷')
 
@@ -344,7 +386,7 @@ def get_cmux_surfaces():
     """cmux tree에서 모든 terminal surface 정보 반환 → [{'ref','title','type'}]"""
     result, ok = _cmux_rpc('system.tree', {'all_windows': True})
     if not ok:
-        if not _cmux_access_denied:
+        if not _cmux_unavailable:
             log(f'[cmux] tree 실패: {str(result)[:80]}', 'warn')
         return []
     surfaces = []
@@ -370,6 +412,11 @@ def _apply_session_defaults(surfaces):
             else:
                 # 제목 업데이트
                 cfg[sid]['title'] = s['title']
+        # 죽은 cmux 세션 설정 GC (surfaces가 정상 조회된 경우에만 — 접근 거부 시 오삭제 방지)
+        live = {f'cmux:{s["ref"]}' for s in surfaces}
+        for dead_sid in [k for k in cfg if k.startswith('cmux:') and k not in live]:
+            del cfg[dead_sid]
+            changed = True
         return changed
 
 def get_cmux_sessions():
@@ -395,7 +442,8 @@ def get_cmux_sessions():
 def write_cmux_session(sid, text):
     """cmux send_text로 터미널에 텍스트 + Enter 전송"""
     surf = sid.replace('cmux:', '')
-    _, ok = _cmux_rpc('surface.send_text', {'surface_id': surf, 'text': text + '\r'})
+    # \r는 이 터미널에서 실제 Enter로 처리되지 않고 텍스트만 입력된 채 남는 문제가 있어 \n 사용
+    _, ok = _cmux_rpc('surface.send_text', {'surface_id': surf, 'text': text + '\n'})
     return ok
 
 
@@ -431,9 +479,20 @@ def is_prompt_idle(text: str) -> bool:
 
 
 def is_rate_limit(text: str) -> bool:
-    t = text.lower()
+    # 스크롤백의 오래된 한도 메시지 재감지 방지: 마지막 12줄만 검사
+    # (재개 후 grace 기간이 지나도 옛 메시지가 60줄 버퍼에 남아 재트리거되던 버그 수정)
+    lines = text.strip().splitlines()
+    t = '\n'.join(lines[-12:]).lower()
     # 오탐 방지: 2개 이상 패턴 매칭 필요 (단일 광범위 패턴 오탐 방어)
     return sum(1 for p in RATE_LIMIT_PATTERNS if p in t) >= 2
+
+
+def _session_kind(text: str) -> str:
+    """세션이 Gemini(Antigravity)인지 Claude인지 판별.
+    토큰/한도가 서로 별개라 rate-limit 쿨다운을 종류별로 따로 추적하기 위함."""
+    lines = text.strip().splitlines()
+    recent = '\n'.join(lines[-6:])
+    return 'gemini' if 'gemini' in recent.lower() else 'claude'
 
 
 def parse_reset_epoch(text: str) -> float:
@@ -794,6 +853,10 @@ def _daily_portfolio_for_repo(repo_path: str, draft: str, date_str: str):
         return text
 
     # Opus 실패 분기
+    if err == 'no_key':
+        log('[daily] ANTHROPIC_API_KEY 미설정 — pending 저장 (키 설정 후 자동 처리)', 'warn')
+        _save_to_pending(repo_path, draft, date_str)
+        return None
     if err == 'rate_limit':
         log(f'[daily] 토큰 한도 — pending 저장 후 종료', 'warn')
         _save_to_pending(repo_path, draft, date_str)
@@ -994,9 +1057,11 @@ def monitor_loop():
     while state['monitoring']:
         try:
             # Rate-limit 중엔 세션 읽기 스킵하고 60초 대기 (Fix: WindowServer 과부하 방지)
+            # Claude/Gemini(Antigravity)는 토큰이 별개이므로 둘 다 한도에 걸렸을 때만 전체 스킵
             with state_lock:
-                is_rate_limited = state['rate_limit_hit']
-            if is_rate_limited:
+                claude_limited = state['rate_limit_hit']
+                gemini_limited = state['rate_limit_hit_gemini']
+            if claude_limited and gemini_limited:
                 time.sleep(60)
                 tick += 1
                 continue
@@ -1030,6 +1095,9 @@ def monitor_loop():
             rate_triggered = False
             rate_limit_content = ''
             rate_limit_sid = ''
+            gemini_rate_triggered = False
+            gemini_rate_limit_content = ''
+            gemini_rate_limit_sid = ''
 
             for sid, content in sessions:
                 # 세션별 설정 확인
@@ -1037,6 +1105,12 @@ def monitor_loop():
                     scfg = state['session_config'].get(sid, {'approve': True, 'continuation': True})
                 approve_on = scfg.get('approve', True)
                 cont_on = scfg.get('continuation', True)
+
+                # Gemini(Antigravity)는 Claude와 토큰이 별개 — 한쪽이 한도에 걸려도
+                # 다른 쪽 세션의 승인/이어서 진행은 계속 감지해야 하므로 종류별로 스킵
+                kind = _session_kind(content)
+                if (kind == 'gemini' and gemini_limited) or (kind == 'claude' and claude_limited):
+                    continue
 
                 # 콘텐츠 변경 감지 (stall 판단용 — 마지막 1500자만 해시)
                 cur_hash = hashlib.md5(content[-1500:].encode()).hexdigest()
@@ -1095,16 +1169,21 @@ def monitor_loop():
                     to_stall.append(sid)
                     _stall_sent.add(sid)
 
-                # M5 fix: grace period 적용
+                # M5 fix: grace period 적용 (Claude/Gemini 종류별로 별도 추적)
                 with state_lock:
                     _auto = state['autonomous_mode']
-                    _hit  = state['rate_limit_hit']
+                    _hit  = state['rate_limit_hit_gemini'] if kind == 'gemini' else state['rate_limit_hit']
                 if (_auto and not _hit
-                        and time.time() > _resume_grace_until
+                        and time.time() > _resume_grace_until[kind]
                         and is_rate_limit(content)):
-                    rate_triggered = True
-                    rate_limit_content = content
-                    rate_limit_sid = sid
+                    if kind == 'gemini':
+                        gemini_rate_triggered = True
+                        gemini_rate_limit_content = content
+                        gemini_rate_limit_sid = sid
+                    else:
+                        rate_triggered = True
+                        rate_limit_content = content
+                        rate_limit_sid = sid
 
             # 배치 처리: delay는 한 번만
             if to_approve or to_continue:
@@ -1187,22 +1266,11 @@ def monitor_loop():
                     else:
                         log('[git] 활성 git 레포지토리를 찾을 수 없음', 'warn')
 
-            # 토큰 한도
+            # 토큰 한도 (Claude/Gemini(Antigravity) 별도 추적 — 한쪽 한도가 다른 쪽을 막지 않음)
             if rate_triggered:
-                reset_epoch = parse_reset_epoch(rate_limit_content)
-                wait_sec = max(60, int(reset_epoch - time.time())) if reset_epoch else 5 * 3600
-                with state_lock:
-                    state['rate_limit_hit'] = True
-                    state['rate_limit_remaining'] = wait_sec
-                if reset_epoch:
-                    from datetime import datetime
-                    reset_str = datetime.fromtimestamp(reset_epoch).strftime('%H:%M:%S')
-                    log(f'⏳ 세션 한도 감지 — {reset_str}에 자동 재개', 'warn')
-                    slack_notify(f'⏳ *토큰 한도 도달* — `{reset_str}`에 자동 재개\n모바일 제어: http://{_local_ip()}:{PORT}/m', '⏳')
-                else:
-                    log('⏳ 세션 한도 감지 — 5시간 후 자동 재개 (리셋 시간 파싱 실패)', 'warn')
-                    slack_notify(f'⏳ *토큰 한도 도달* — 5시간 후 자동 재개\n모바일 제어: http://{_local_ip()}:{PORT}/m', '⏳')
-                threading.Thread(target=auto_wait_loop, args=(reset_epoch, rate_limit_sid), daemon=True).start()
+                _handle_rate_trigger('claude', rate_limit_content, rate_limit_sid)
+            if gemini_rate_triggered:
+                _handle_rate_trigger('gemini', gemini_rate_limit_content, gemini_rate_limit_sid)
 
             # 종료된 세션 정리 (Fix 10: 보조 dict도 GC)
             with _active_lock:
@@ -1227,25 +1295,53 @@ def monitor_loop():
 
 
 # ─── 자율 모드 타이머 ──────────────────────────────────────────────────
-def auto_wait_loop(reset_epoch: float = 0, trigger_sid: str = ''):
+def _handle_rate_trigger(kind: str, content: str, sid: str):
+    """Claude/Gemini(Antigravity) 토큰 한도 감지 시 처리.
+    둘은 토큰이 완전히 별개이므로 상태(hit/remaining/grace)를 종류별로 분리해
+    한쪽 한도 도달이 다른 쪽 모니터링/쿨다운에 영향을 주지 않게 한다."""
+    hit_key = 'rate_limit_hit' if kind == 'claude' else 'rate_limit_hit_gemini'
+    rem_key = 'rate_limit_remaining' if kind == 'claude' else 'rate_limit_remaining_gemini'
+    label = 'Claude' if kind == 'claude' else 'Gemini(Antigravity)'
+
+    reset_epoch = parse_reset_epoch(content)
+    wait_sec = max(60, int(reset_epoch - time.time())) if reset_epoch else 5 * 3600
+    with state_lock:
+        state[hit_key] = True
+        state[rem_key] = wait_sec
+    if reset_epoch:
+        from datetime import datetime
+        reset_str = datetime.fromtimestamp(reset_epoch).strftime('%H:%M:%S')
+        log(f'⏳ {label} 세션 한도 감지 — {reset_str}에 자동 재개', 'warn')
+        slack_notify(f'⏳ *{label} 토큰 한도 도달* — `{reset_str}`에 자동 재개\n모바일 제어: http://{_local_ip()}:{PORT}/m', '⏳')
+    else:
+        log(f'⏳ {label} 세션 한도 감지 — 5시간 후 자동 재개 (리셋 시간 파싱 실패)', 'warn')
+        slack_notify(f'⏳ *{label} 토큰 한도 도달* — 5시간 후 자동 재개\n모바일 제어: http://{_local_ip()}:{PORT}/m', '⏳')
+    threading.Thread(target=auto_wait_loop, args=(reset_epoch, sid, kind), daemon=True).start()
+
+
+def auto_wait_loop(reset_epoch: float = 0, trigger_sid: str = '', kind: str = 'claude'):
     global _resume_grace_until
+
+    hit_key = 'rate_limit_hit' if kind == 'claude' else 'rate_limit_hit_gemini'
+    rem_key = 'rate_limit_remaining' if kind == 'claude' else 'rate_limit_remaining_gemini'
+    label = 'Claude' if kind == 'claude' else 'Gemini(Antigravity)'
 
     target = reset_epoch if reset_epoch > time.time() else time.time() + 5 * 3600
     while time.time() < target:
         with state_lock:
             if not state['autonomous_mode']:
                 return
-            state['rate_limit_remaining'] = max(0, int(target - time.time()))
+            state[rem_key] = max(0, int(target - time.time()))
         time.sleep(5)  # 1초→5초: UI countdown 정밀도 소폭 감소, CPU 낭비 제거
 
     with state_lock:
-        state['rate_limit_remaining'] = 0
-        still_on = state['autonomous_mode'] and state['rate_limit_hit']
+        state[rem_key] = 0
+        still_on = state['autonomous_mode'] and state[hit_key]
     if not still_on:
         return
 
-    log('🚀 토큰 초기화 완료 — 재개 명령어 전송', 'ok')
-    slack_notify('🚀 *토큰 초기화 완료* — 작업 재개 중', '🚀')
+    log(f'🚀 {label} 토큰 초기화 완료 — 재개 명령어 전송', 'ok')
+    slack_notify(f'🚀 *{label} 토큰 초기화 완료* — 작업 재개 중', '🚀')
     time.sleep(3)
 
     with state_lock:
@@ -1262,21 +1358,25 @@ def auto_wait_loop(reset_epoch: float = 0, trigger_sid: str = ''):
             if ok:
                 sent += 1
 
-    # 트리거 세션 전송 실패 시 continuation 켜진 모든 세션으로 폴백
+    # 트리거 세션 전송 실패 시, 같은 종류(kind)이고 continuation 켜진 세션으로만 폴백
     if not sent:
-        for s in get_cmux_surfaces():
-            sid = f'cmux:{s["ref"]}'
-            if scfgs.get(sid, {}).get('continuation', True):
-                if write_cmux_session(sid, cmd):
+        for s_sid, s_content in get_cmux_sessions():
+            if _session_kind(s_content) != kind:
+                continue
+            if scfgs.get(s_sid, {}).get('continuation', True):
+                if write_cmux_session(s_sid, cmd):
                     sent += 1
-        for sid, _ in get_iterm2_sessions():
-            if scfgs.get(sid, {}).get('continuation', True):  # Fix 2: config 확인
-                if write_iterm2_session(sid, cmd):
+        for s_sid, s_content in get_iterm2_sessions():
+            if _session_kind(s_content) != kind:
+                continue
+            if scfgs.get(s_sid, {}).get('continuation', True):  # Fix 2: config 확인
+                if write_iterm2_session(s_sid, cmd):
                     sent += 1
 
     if sent:
-        log(f'📨 재개 명령어 전송 → {sent}개 세션', 'ok')
-    else:
+        log(f'📨 {label} 재개 명령어 전송 → {sent}개 세션', 'ok')
+    elif kind == 'claude':
+        # 포커스된 화면 기준 키스트로크 폴백이라 종류 구분이 불가능 — 기존처럼 Claude 전용으로만 유지
         safe = cmd.replace('"', '\\"')
         osascript(f'''
 tell application "System Events"
@@ -1288,11 +1388,11 @@ end tell
         log('📨 재개 명령어 전송 (폴백)', 'ok')
 
     with state_lock:
-        state['rate_limit_hit'] = False
+        state[hit_key] = False
 
-    # M5 fix: 재개 후 120초 동안 rate-limit 재감지 억제
-    _resume_grace_until = time.time() + 120
-    log('⏸ grace period 2분 — rate-limit 재감지 억제 중', 'info')
+    # M5 fix: 재개 후 120초 동안 rate-limit 재감지 억제 (종류별로 별도)
+    _resume_grace_until[kind] = time.time() + 120
+    log(f'⏸ {label} grace period 2분 — rate-limit 재감지 억제 중', 'info')
 
 
 # ─── 화면 크기 조회 (Screen Recording 권한 불필요) ────────────────────────
@@ -1353,7 +1453,7 @@ def capture_region_b64():
     now = time.time()
     # Rate-limit 중엔 30초, 평상시엔 5초 간격으로만 실제 캡처
     with state_lock:
-        limited = state['rate_limit_hit']
+        limited = state['rate_limit_hit'] or state['rate_limit_hit_gemini']
     min_interval = 30 if limited else PREVIEW_MIN_INTERVAL
     with _preview_lock:
         if now - _preview_cache['ts'] < min_interval and _preview_cache['b64']:
@@ -1435,12 +1535,15 @@ class Handler(BaseHTTPRequestHandler):
             # Fix 7: 락 안에서 스냅샷 후 직렬화 (logs 등 동시 쓰기 충돌 방지)
             with state_lock:
                 rem = state['rate_limit_remaining']
+                rem_g = state['rate_limit_remaining_gemini']
                 snap = {
                     'monitoring': state['monitoring'],
                     'autonomous': state['autonomous_mode'],
                     'continuation_mode': state['continuation_mode'],
                     'rate_limit_hit': state['rate_limit_hit'],
                     'rate_limit_countdown': f'{rem//3600:02d}:{(rem%3600)//60:02d}:{rem%60:02d}' if rem else '',
+                    'rate_limit_hit_gemini': state['rate_limit_hit_gemini'],
+                    'rate_limit_countdown_gemini': f'{rem_g//3600:02d}:{(rem_g%3600)//60:02d}:{rem_g%60:02d}' if rem_g else '',
                     'approve_count': state['approve_count'],
                     'continuation_count': state['continuation_count'],
                     'stall_count': state['stall_count'],
@@ -1535,7 +1638,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not enabled:
                     state['rate_limit_hit'] = False
                     state['rate_limit_remaining'] = 0
+                    state['rate_limit_hit_gemini'] = False
+                    state['rate_limit_remaining_gemini'] = 0
             log(f'자율 모드 {"활성화" if enabled else "비활성화"}')
+            _save_settings()
             self._json(200, {'ok': True})
 
         elif p == '/api/continuation':
@@ -1543,6 +1649,7 @@ class Handler(BaseHTTPRequestHandler):
             with state_lock:
                 state['continuation_mode'] = enabled
             log(f'이어서 진행 모드 {"활성화" if enabled else "비활성화"}')
+            _save_settings()
             self._json(200, {'ok': True})
 
         elif p == '/api/settings':
@@ -1556,6 +1663,7 @@ class Handler(BaseHTTPRequestHandler):
                     state['stall_git'] = bool(body['stall_git'])
                 if 'idle_send_timeout' in body:
                     state['idle_send_timeout'] = max(60, int(body['idle_send_timeout']))
+            _save_settings()
             self._json(200, {'ok': True})
 
         elif p == '/api/send':
@@ -1601,6 +1709,7 @@ class Handler(BaseHTTPRequestHandler):
                 if 'continuation' in body:
                     cfg['continuation'] = bool(body['continuation'])
             log(f'[세션] {sid[:24]}: approve={cfg["approve"]} cont={cfg["continuation"]}', 'info')
+            _save_settings()
             self._json(200, {'ok': True})
 
         else:
@@ -1823,7 +1932,7 @@ main{display:grid;grid-template-columns:280px 1fr;gap:14px;padding:14px;height:c
   <!-- ── 오른쪽 컬럼 ── -->
   <div class="right-col">
     <div id="preview-wrap">
-      <h2>모니터링 미리보기 (2초마다 갱신)</h2>
+      <h2>모니터링 미리보기 (5초마다 갱신)</h2>
       <div id="preview-ph">영역 선택 후 미리보기 표시</div>
       <img id="preview" style="display:none" alt="preview">
       <div class="region-info" id="region-info2"></div>
@@ -1890,10 +1999,15 @@ async function pollStatus() {
       selRegion = {x:d.region[0],y:d.region[1],w:d.region[2],h:d.region[3]};
       showRegionInfo();
     }
-    document.getElementById('delay').value = d.delay_sec ?? 1;
-    document.getElementById('cont-cmd').value = d.continuation_cmd || '이어서 진행해줘';
-    document.getElementById('resume-cmd').value = d.resume_cmd || '개발 계속해줘';
-    document.getElementById('idle-timeout').value = Math.round((d.idle_send_timeout ?? 600) / 60);
+    // 사용자가 입력 중인 필드는 폴링이 덮어쓰지 않도록 보호
+    const setIfNotFocused = (id, val) => {
+      const el = document.getElementById(id);
+      if (el && el !== document.activeElement) el.value = val;
+    };
+    setIfNotFocused('delay', d.delay_sec ?? 1);
+    setIfNotFocused('cont-cmd', d.continuation_cmd || '이어서 진행해줘');
+    setIfNotFocused('resume-cmd', d.resume_cmd || '개발 계속해줘');
+    setIfNotFocused('idle-timeout', Math.round((d.idle_send_timeout ?? 600) / 60));
     autoOn = d.autonomous;
     contOn = d.continuation_mode;
     stallGitOn = d.stall_git ?? true;
@@ -1929,9 +2043,12 @@ function renderStatus(d) {
     dot.className = 'dot idle'; txt.textContent = '대기 중';
   }
 
-  if (d.rate_limit_hit && d.rate_limit_countdown) {
+  const _timerParts = [];
+  if (d.rate_limit_hit && d.rate_limit_countdown) _timerParts.push('Claude ' + d.rate_limit_countdown);
+  if (d.rate_limit_hit_gemini && d.rate_limit_countdown_gemini) _timerParts.push('Gemini ' + d.rate_limit_countdown_gemini);
+  if (_timerParts.length) {
     timer.style.display = 'block';
-    document.getElementById('timer').textContent = d.rate_limit_countdown;
+    document.getElementById('timer').textContent = _timerParts.join(' / ');
   } else {
     timer.style.display = 'none';
   }
@@ -2414,9 +2531,12 @@ async function poll() {
       dot.className = 'dot'; status.textContent = '대기 중';
       btn.className = 'btn btn-green'; btn.textContent = '▶  모니터 시작';
     }
-    if (d.rate_limit_hit && d.rate_limit_countdown) {
+    const _mTimerParts = [];
+    if (d.rate_limit_hit && d.rate_limit_countdown) _mTimerParts.push('Claude ' + d.rate_limit_countdown);
+    if (d.rate_limit_hit_gemini && d.rate_limit_countdown_gemini) _mTimerParts.push('Gemini ' + d.rate_limit_countdown_gemini);
+    if (_mTimerParts.length) {
       document.getElementById('timer-box').style.display = 'block';
-      document.getElementById('timer').textContent = d.rate_limit_countdown;
+      document.getElementById('timer').textContent = _mTimerParts.join(' / ');
       dot.className = 'dot warn'; status.textContent = '토큰 한도';
     } else {
       document.getElementById('timer-box').style.display = 'none';
@@ -2505,7 +2625,9 @@ def main():
         '🟢'
     )
 
-    server = HTTPServer((HOST, PORT), Handler)
+    # ThreadingHTTPServer: 스크린샷 캡처(최대 3초) 중에도 상태 폴링이 막히지 않도록
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server.daemon_threads = True
     threading.Thread(target=lambda: (time.sleep(1.2), webbrowser.open(f'http://localhost:{PORT}')), daemon=True).start()
     threading.Thread(target=_hourly_git_push_loop, daemon=True).start()
 

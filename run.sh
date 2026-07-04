@@ -1,8 +1,8 @@
 #!/bin/bash
 cd "$(dirname "$0")"
 
-# 이미 실행 중이면 종료
-if lsof -ti :17654 &>/dev/null; then
+# 이미 실행 중이면 종료 (LISTEN 소켓만 검사)
+if lsof -nP -iTCP:17654 -sTCP:LISTEN -t &>/dev/null; then
     echo "이미 실행 중 (port 17654)"
     exit 0
 fi
@@ -12,13 +12,17 @@ if [ -n "$CMUX_SURFACE_ID" ]; then
     exec python3 app.py
 fi
 
-# cmux가 실행 중이면 새 탭에서 시작 (cmux 세션 감지를 위해 내부 실행 필요)
-if command -v cmux &>/dev/null && pgrep -x cmux &>/dev/null; then
-    SURF=$(cmux new-surface 2>/dev/null | grep -oE 'surface:[0-9]+')
+# cmux CLI 경로: PATH 우선, 없으면 번들 경로
+CMUX_BIN="/Applications/cmux.app/Contents/Resources/bin/cmux"
+command -v cmux &>/dev/null && CMUX_BIN="$(command -v cmux)"
+
+# cmux 새 탭 생성을 직접 시도 (pgrep은 샌드박스/launchd 환경에서 신뢰 불가)
+if [ -x "$CMUX_BIN" ]; then
+    SURF=$("$CMUX_BIN" new-surface 2>/dev/null | grep -oE 'surface:[0-9]+')
     if [ -n "$SURF" ]; then
-        cmux rename-tab --surface "$SURF" "클로드 오토어프로브" 2>/dev/null
-        cmux send --surface "$SURF" "cd ~/claude-auto-approve && python3 app.py"
-        cmux send-key --surface "$SURF" enter
+        "$CMUX_BIN" rename-tab --surface "$SURF" "클로드 오토어프로브" 2>/dev/null
+        "$CMUX_BIN" send --surface "$SURF" "cd ~/claude-auto-approve && exec python3 app.py"
+        "$CMUX_BIN" send-key --surface "$SURF" enter
         echo "✅ cmux 탭에서 시작됨 (surface: $SURF)"
         exit 0
     fi
