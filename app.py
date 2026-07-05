@@ -463,6 +463,14 @@ def is_continuation(text: str) -> bool:
     return any(p in recent for p in CONTINUATION_PATTERNS)
 
 
+def is_feedback_survey(text: str) -> bool:
+    """Claude Code 피드백 설문('How is Claude doing this session?') 감지.
+    숫자 선택만 받는 오버레이라 continuation 텍스트로는 안 닫힘 → '0'(Dismiss) 전송 필요."""
+    lines = text.strip().splitlines()
+    t = '\n'.join(lines[-15:]).lower()
+    return 'how is claude doing' in t and 'dismiss' in t
+
+
 def is_prompt_idle(text: str) -> bool:
     """Claude Code 입력 대기 프롬프트 감지 — 완료 후 대기 중인 경우"""
     lines = text.strip().splitlines()
@@ -1091,6 +1099,7 @@ def monitor_loop():
             # M7 fix: 배치 수집 후 한 번에 처리 (per-session sleep 제거)
             to_approve  = []  # (sid,) — 새로 다이얼로그 발생
             to_continue = []  # (sid,) — 새로 continuation 발생
+            to_dismiss  = []  # (sid,) — 피드백 설문 → '0'으로 닫기
             to_stall    = []  # (sid,) — 30분 이상 멈춤
             rate_triggered = False
             rate_limit_content = ''
@@ -1123,16 +1132,19 @@ def monitor_loop():
                 with state_lock:
                     cont_mode_on = state['continuation_mode']
 
-                dlg = approve_on and is_dialog(content)
+                now = time.time()
+                # 피드백 설문은 숫자만 받는 오버레이 — continuation 텍스트가 안 먹히므로 '0'으로 닫는다
+                survey = (approve_on and is_feedback_survey(content)
+                          and (now - _dialog_last_sent.get(sid, 0)) >= DIALOG_COOLDOWN)
+                dlg = (not survey) and approve_on and is_dialog(content)
                 cont_mode = cont_mode_on and cont_on
                 # Fix 4: cnt도 쿨다운 게이트 적용
-                now = time.time()
-                cnt = (cont_mode and is_continuation(content)
+                cnt = (cont_mode and not survey and is_continuation(content)
                        and (now - _cont_last_sent.get(sid, 0)) >= CONT_IDLE_COOLDOWN)
                 # idle: ❯ 프롬프트 상태 + 콘텐츠가 IDLE_SEND_TIMEOUT(기본 10분) 동안 안 변했을 때만
                 with state_lock:
                     idle_timeout = state.get('idle_send_timeout', IDLE_SEND_TIMEOUT)
-                idle = (cont_mode and not cnt and not dlg
+                idle = (cont_mode and not cnt and not dlg and not survey
                         and is_prompt_idle(content)
                         and (now - _content_unchanged_since.get(sid, now)) >= idle_timeout
                         and (now - _cont_last_sent.get(sid, 0)) >= CONT_IDLE_COOLDOWN)
@@ -1165,6 +1177,9 @@ def monitor_loop():
                         if idle:
                             log(f'[idle] {sid[:20]}: Claude 대기 감지 → 이어서 진행 전송', 'info')
 
+                if survey:
+                    to_dismiss.append(sid)
+
                 if stall:
                     to_stall.append(sid)
                     _stall_sent.add(sid)
@@ -1184,6 +1199,14 @@ def monitor_loop():
                         rate_triggered = True
                         rate_limit_content = content
                         rate_limit_sid = sid
+
+            # 피드백 설문 닫기: '0'(Dismiss) 전송
+            for sid in to_dismiss:
+                ok = (write_cmux_session(sid, '0') if sid.startswith('cmux:')
+                      else write_iterm2_session(sid, '0'))
+                if ok:
+                    _dialog_last_sent[sid] = time.time()
+                    log(f'📋 피드백 설문 자동 닫기(0: Dismiss) → {sid[:20]}', 'ok')
 
             # 배치 처리: delay는 한 번만
             if to_approve or to_continue:
