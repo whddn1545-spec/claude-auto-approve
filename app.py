@@ -198,6 +198,11 @@ _active_lock = threading.Lock()
 _cont_last_sent: dict[str, float] = {}
 CONT_IDLE_COOLDOWN = 90.0  # 이어서 전송 후 90초간 재전송 억제
 
+# idle 넛지 연속 횟수 추적 — 태스크 없는 세션에 무한 넛지로 토큰 낭비 방지
+# 3회 연속 idle 넛지 후에도 실질 진행이 없으면 간격을 2배씩 늘림 (최대 1시간)
+_idle_sent_streak: dict[str, int] = {}
+IDLE_BACKOFF_MAX = 3600.0
+
 # 다이얼로그 승인 쿨다운 (연속 다이얼로그 이중 클릭 방지)
 _dialog_last_sent: dict[str, float] = {}
 DIALOG_COOLDOWN = 4.0  # 승인 후 4초간 재승인 억제
@@ -1100,6 +1105,7 @@ def monitor_loop():
             to_approve  = []  # (sid,) — 새로 다이얼로그 발생
             to_continue = []  # (sid,) — 새로 continuation 발생
             to_dismiss  = []  # (sid,) — 피드백 설문 → '0'으로 닫기
+            idle_sids   = set()  # to_continue 중 idle 넛지로 발생한 세션 (백오프 추적용)
             to_stall    = []  # (sid,) — 30분 이상 멈춤
             rate_triggered = False
             rate_limit_content = ''
@@ -1144,10 +1150,14 @@ def monitor_loop():
                 # idle: ❯ 프롬프트 상태 + 콘텐츠가 IDLE_SEND_TIMEOUT(기본 10분) 동안 안 변했을 때만
                 with state_lock:
                     idle_timeout = state.get('idle_send_timeout', IDLE_SEND_TIMEOUT)
+                # 연속 idle 넛지 백오프: 3회까진 기본 쿨다운, 이후 2배씩 증가 (최대 1시간)
+                # → 태스크 없는 세션("Send a task"만 반복)에 밤새 넛지하는 토큰 낭비 방지
+                streak = _idle_sent_streak.get(sid, 0)
+                idle_cooldown = min(CONT_IDLE_COOLDOWN * (2 ** max(0, streak - 2)), IDLE_BACKOFF_MAX)
                 idle = (cont_mode and not cnt and not dlg and not survey
                         and is_prompt_idle(content)
                         and (now - _content_unchanged_since.get(sid, now)) >= idle_timeout
-                        and (now - _cont_last_sent.get(sid, 0)) >= CONT_IDLE_COOLDOWN)
+                        and (now - _cont_last_sent.get(sid, 0)) >= idle_cooldown)
 
                 # 30분 이상 멈춤 감지 (idle 프롬프트 상태 + 내용 unchanged)
                 stall = (
@@ -1175,6 +1185,7 @@ def monitor_loop():
                         _active_continuations.add(sid)
                         to_continue.append(sid)
                         if idle:
+                            idle_sids.add(sid)
                             log(f'[idle] {sid[:20]}: Claude 대기 감지 → 이어서 진행 전송', 'info')
 
                 if survey:
@@ -1223,6 +1234,7 @@ def monitor_loop():
                         ok = write_iterm2_session(sid, '1')
                     if ok:
                         _dialog_last_sent[sid] = time.time()
+                        _idle_sent_streak[sid] = 0  # 다이얼로그 = 실제 작업 진행 중 → 백오프 리셋
                         with _active_lock:
                             _active_dialogs.discard(sid)  # 승인 즉시 클리어 → 다음 다이얼로그 바로 감지
                         with state_lock:
@@ -1248,6 +1260,11 @@ def monitor_loop():
                         ok = write_iterm2_session(sid, cmd)
                     if ok:
                         _cont_last_sent[sid] = time.time()
+                        # idle 넛지면 스트릭 증가(백오프), 진짜 continuation 질문이면 실제 활동 → 리셋
+                        if sid in idle_sids:
+                            _idle_sent_streak[sid] = _idle_sent_streak.get(sid, 0) + 1
+                        else:
+                            _idle_sent_streak[sid] = 0
                         with state_lock:
                             state['continuation_count'] += 1
                         log(f'📨 이어서 진행 → 세션 {sid[:8]}... "{cmd}" (총 {state["continuation_count"]}회)', 'ok')
@@ -1305,6 +1322,7 @@ def monitor_loop():
                 _content_unchanged_since.pop(d, None)
                 _cont_last_sent.pop(d, None)
                 _dialog_last_sent.pop(d, None)
+                _idle_sent_streak.pop(d, None)
                 _stall_sent.discard(d)
 
             tick += 1
