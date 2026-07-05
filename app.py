@@ -447,8 +447,12 @@ def get_cmux_sessions():
 def write_cmux_session(sid, text):
     """cmux send_text로 터미널에 텍스트 + Enter 전송"""
     surf = sid.replace('cmux:', '')
+    # 명령 텍스트(2자 이상)는 Ctrl+U(\x15)로 입력창의 잔여 타이핑을 먼저 지움
+    # — 입력창에 쓰다 만 텍스트가 남아 있으면 명령이 뒤에 이어붙어 오염되는 문제 방지.
+    # 단일 문자('1'/'0' 다이얼로그 선택)는 다이얼로그가 Ctrl+U를 오해할 수 있어 그대로 전송.
+    payload = ('\x15' + text) if len(text) > 1 else text
     # \r는 이 터미널에서 실제 Enter로 처리되지 않고 텍스트만 입력된 채 남는 문제가 있어 \n 사용
-    _, ok = _cmux_rpc('surface.send_text', {'surface_id': surf, 'text': text + '\n'})
+    _, ok = _cmux_rpc('surface.send_text', {'surface_id': surf, 'text': payload + '\n'})
     return ok
 
 
@@ -462,9 +466,10 @@ def is_dialog(text: str) -> bool:
 
 
 def is_continuation(text: str) -> bool:
-    # M1 fix: 전체 텍스트 대신 마지막 8줄만 검사 → 오탐 대폭 감소
+    # 마지막 14줄 검사 — 8줄은 질문 뒤에 안내문("new task? /clear...")·입력창·상태바가
+    # 붙으면 질문이 창 밖으로 벗어나 놓치는 사례가 있었음. 오탐은 쿨다운+활성추적으로 방어.
     lines = text.strip().splitlines()
-    recent = '\n'.join(lines[-8:]).lower()
+    recent = '\n'.join(lines[-14:]).lower()
     return any(p in recent for p in CONTINUATION_PATTERNS)
 
 
