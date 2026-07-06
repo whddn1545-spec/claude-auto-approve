@@ -8,6 +8,10 @@ fi
 CMUX_BIN="/Applications/cmux.app/Contents/Resources/bin/cmux"
 command -v cmux &>/dev/null && CMUX_BIN="$(command -v cmux)"
 
+# 소켓 비밀번호가 있으면 export → cmux 트리 밖(launchd/고아)에서도 CLI 인증 가능
+PW_FILE="$HOME/claude-auto-approve/.cmux-password"
+[ -f "$PW_FILE" ] && export CMUX_SOCKET_PASSWORD="$(cat "$PW_FILE")"
+
 start_fallback() {
     cd "$(dirname "$0")"
     nohup python3 app.py >> /tmp/claude-auto-approve-fallback.log 2>&1 &

@@ -307,7 +307,20 @@ import uuid as _uuid
 CMUX_SOCK = os.path.expanduser('~/Library/Application Support/cmux/cmux.sock')
 CMUX_CLI = os.environ.get('CMUX_BUNDLED_CLI_PATH', '/Applications/cmux.app/Contents/Resources/bin/cmux')
 
+# 소켓 비밀번호: cmux Settings에서 socket control password 설정 후 이 파일에 저장하면
+# CLI가 CMUX_SOCKET_PASSWORD로 인증 → cmux 트리 밖(고아/launchd)에서도 접근 가능해짐
+CMUX_PW_FILE = os.path.expanduser('~/claude-auto-approve/.cmux-password')
+try:
+    with open(CMUX_PW_FILE) as _f:
+        _pw = _f.read().strip()
+    if _pw:
+        os.environ['CMUX_SOCKET_PASSWORD'] = _pw
+except OSError:
+    pass
+_cmux_has_password = bool(os.environ.get('CMUX_SOCKET_PASSWORD'))
+
 _cmux_inside = bool(os.environ.get('CMUX_SURFACE_ID'))  # cmux 내부에서 실행 중이면 True
+_cmux_fail_streak = 0       # 연속 tree 실패 횟수 (워치독용)
 _cmux_use_cli = False       # 소켓 인증 거부 시 번들 CLI(`cmux rpc`) 경유로 전환
 _cmux_unavailable = False   # 소켓도 CLI도 불가 — 이후 시도 생략
 
@@ -389,11 +402,14 @@ def _is_claude_title(title: str) -> bool:
 
 def get_cmux_surfaces():
     """cmux tree에서 모든 terminal surface 정보 반환 → [{'ref','title','type'}]"""
+    global _cmux_fail_streak
     result, ok = _cmux_rpc('system.tree', {'all_windows': True})
     if not ok:
+        _cmux_fail_streak += 1
         if not _cmux_unavailable:
             log(f'[cmux] tree 실패: {str(result)[:80]}', 'warn')
         return []
+    _cmux_fail_streak = 0
     surfaces = []
     for win in result.get('windows', []):
         for ws in win.get('workspaces', []):
@@ -979,6 +995,22 @@ def run_daily_portfolio():
             except Exception:
                 pass
             _commit_portfolio(repo, date_str)
+
+
+def _cmux_watchdog_loop():
+    """cmux 접근이 연속 실패하면(탭 닫힘 등으로 고아화) 프로세스를 종료해
+    launchd(5분 주기 ensure_running)가 새로 띄우도록 한다.
+    소켓 비밀번호가 설정된 경우에만 동작 — 비밀번호 없이는 재시작해도 복구가
+    보장되지 않아 재시작 루프만 돌게 되므로 제외."""
+    while True:
+        time.sleep(60)
+        if not _cmux_has_password:
+            continue
+        if _cmux_fail_streak >= 15 and os.path.exists(CMUX_SOCK) and state.get('monitoring'):
+            log('[watchdog] cmux 접근 연속 실패 — launchd 재시작을 위해 종료', 'error')
+            slack_notify('🔁 *cmux 접근 실패 감지* — 자동 재시작을 위해 종료합니다', '🔁')
+            _save_settings()
+            os._exit(17)
 
 
 # 1시간마다 자동 git commit/push
@@ -2680,6 +2712,7 @@ def main():
     server.daemon_threads = True
     threading.Thread(target=lambda: (time.sleep(1.2), webbrowser.open(f'http://localhost:{PORT}')), daemon=True).start()
     threading.Thread(target=_hourly_git_push_loop, daemon=True).start()
+    threading.Thread(target=_cmux_watchdog_loop, daemon=True).start()
 
     # 저장된 설정에서 자동 재개
     if _saved.get('autostart') and state.get('region'):
