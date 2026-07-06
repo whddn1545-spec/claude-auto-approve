@@ -152,6 +152,10 @@ DIALOG_PATTERNS = [
     '↑/↓ navigate',
     'enter select',
     'write-in...',
+    # Claude in Chrome 브라우저 권한 다이얼로그: "1. Allow / 2. Allow all... / 3. Deny (esc)"
+    'claude in chrome wants',
+    'allow all actions',
+    'deny (esc)',
 ]
 
 CONTINUATION_PATTERNS = [
