@@ -501,6 +501,10 @@ def is_rate_limit(text: str) -> bool:
     # (재개 후 grace 기간이 지나도 옛 메시지가 60줄 버퍼에 남아 재트리거되던 버그 수정)
     lines = text.strip().splitlines()
     t = '\n'.join(lines[-12:]).lower()
+    # 'approaching usage limit · resets X' 는 한도 "접근 중" 경고일 뿐 실제 차단이 아님
+    # — 세션이 멀쩡히 작업 중인데 몇 시간씩 대기에 들어가던 오탐 원인
+    if 'approaching' in t:
+        return False
     # 오탐 방지: 2개 이상 패턴 매칭 필요 (단일 광범위 패턴 오탐 방어)
     return sum(1 for p in RATE_LIMIT_PATTERNS if p in t) >= 2
 
