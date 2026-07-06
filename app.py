@@ -96,6 +96,7 @@ def _save_settings():
                 'region', 'autonomous_mode', 'continuation_mode',
                 'resume_cmd', 'continuation_cmd', 'delay_sec',
                 'stall_git', 'idle_send_timeout', 'session_config',
+                'preview_enabled',
             )}
             data['autostart'] = state.get('monitoring', False)
         with open(SETTINGS_FILE, 'w') as f:
@@ -126,6 +127,9 @@ state = {
     'stall_count': 0,
     'stall_git': _saved.get('stall_git', True),
     'idle_send_timeout': _saved.get('idle_send_timeout', 10 * 60),
+    # 화면 미리보기(스크린샷) — 기본 꺼짐: 모니터링은 텍스트(RPC) 기반이라 불필요하고,
+    # 켜면 최신 macOS가 호스트 앱(cmux) 이름으로 화면 기록 권한 요청을 반복해서 띄움
+    'preview_enabled': _saved.get('preview_enabled', False),
 }
 state_lock = threading.Lock()
 
@@ -247,10 +251,17 @@ def osascript(script, timeout=6):
 _FSEP = '<<<FIELD>>>'  # 세션ID / 내용 구분자
 _RSEP = '<<<REC>>>'    # 세션 레코드 구분자 (터미널 내용에 절대 등장 안 하는 토큰)
 
+# iTerm2 미설치 시 AppleScript 자체를 건너뜀 — 2초마다 System Events를 호출하면
+# macOS가 호스트 앱(cmux) 이름으로 자동화 권한 요청을 반복해서 띄우는 문제 방지
+_ITERM_INSTALLED = (os.path.exists('/Applications/iTerm.app')
+                    or os.path.exists(os.path.expanduser('~/Applications/iTerm.app')))
+
 def get_iterm2_sessions():
     """모든 iTerm2 세션의 (session_id, content) 목록 반환.
     C1 fix: 리스트 대신 문자열 concatenation으로 반환 → ', ' split 파싱 버그 제거.
     """
+    if not _ITERM_INSTALLED:
+        return []
     script = f'''
 tell application "System Events"
     if not (exists process "iTerm2") then return ""
@@ -283,6 +294,8 @@ return out
 
 def write_iterm2_session(session_id, text):
     """특정 iTerm2 세션에 텍스트 + Enter 전송"""
+    if not _ITERM_INSTALLED:
+        return False
     safe = text.replace('\\', '\\\\').replace('"', '\\"')
     script = f'''
 tell application "System Events"
@@ -478,6 +491,11 @@ def write_cmux_session(sid, text):
 
 # ─── 감지 로직 ────────────────────────────────────────────────────────
 def is_dialog(text: str) -> bool:
+    # 입력창(빈 ❯ 프롬프트/단축키 힌트)이 떠 있으면 다이얼로그가 아님 —
+    # 실제 다이얼로그는 입력창을 대체함. 대화 중 다이얼로그 문구를 "인용"한 화면을
+    # 진짜 다이얼로그로 오인해 '1'을 반복 전송하던 자기참조 오탐 방지.
+    if is_prompt_idle(text):
+        return False
     # 스크롤백의 이전 다이얼로그 오탐 방지: 마지막 15줄만 검사
     lines = text.strip().splitlines()
     t = '\n'.join(lines[-15:]).lower()
@@ -1533,6 +1551,9 @@ def _grab_screen(bbox=None):
 
 
 def capture_region_b64():
+    with state_lock:
+        if not state.get('preview_enabled'):
+            return None
     region = state['region']
     if not region:
         return None
@@ -1563,6 +1584,9 @@ def capture_region_b64():
 
 
 def capture_fullscreen_b64():
+    with state_lock:
+        if not state.get('preview_enabled'):
+            return None, 1440, 900, 1440, 900, 1440, 900  # 캡처·osascript 호출 없이 기본값
     sw, sh = get_screen_size()
     try:
         img = _grab_screen()
@@ -1642,6 +1666,7 @@ class Handler(BaseHTTPRequestHandler):
                     'delay_sec': state['delay_sec'],
                     'stall_git': state['stall_git'],
                     'idle_send_timeout': state['idle_send_timeout'],
+                    'preview_enabled': state['preview_enabled'],
                 }
             self._json(200, snap)
 
@@ -1749,6 +1774,8 @@ class Handler(BaseHTTPRequestHandler):
                     state['stall_git'] = bool(body['stall_git'])
                 if 'idle_send_timeout' in body:
                     state['idle_send_timeout'] = max(60, int(body['idle_send_timeout']))
+                if 'preview_enabled' in body:
+                    state['preview_enabled'] = bool(body['preview_enabled'])
             _save_settings()
             self._json(200, {'ok': True})
 
@@ -1974,6 +2001,10 @@ main{display:grid;grid-template-columns:280px 1fr;gap:14px;padding:14px;height:c
         <div class="sw green on" id="stall-git-sw"></div>
         <div class="sw-label">30분 멈춤 시 Git 자동 커밋<br><span style="color:#555;font-size:10px">재개 명령 전송 + GitHub 푸시</span></div>
       </div>
+      <div class="toggle-row" onclick="togglePreview()">
+        <div class="sw" id="preview-sw"></div>
+        <div class="sw-label">화면 미리보기 (스크린샷)<br><span style="color:#555;font-size:10px">끄면 macOS 화면기록 권한 팝업 방지</span></div>
+      </div>
 
       <!-- 자율모드 타이머 -->
       <div class="timer-box" id="timer-box">
@@ -2065,7 +2096,7 @@ main{display:grid;grid-template-columns:280px 1fr;gap:14px;padding:14px;height:c
 
 <script>
 // ── 상태 ───────────────────────────────────────────────────────────
-let autoOn = false, contOn = true, stallGitOn = true;
+let autoOn = false, contOn = true, stallGitOn = true, previewOn = false;
 let selRegion = null;
 let origW = 1, origH = 1, dispW = 1, dispH = 1;
 let drawing = false, sx = 0, sy = 0, ex = 0, ey = 0;
@@ -2097,6 +2128,13 @@ async function pollStatus() {
     autoOn = d.autonomous;
     contOn = d.continuation_mode;
     stallGitOn = d.stall_git ?? true;
+    previewOn = d.preview_enabled ?? false;
+    document.getElementById('preview-sw').className = 'sw' + (previewOn ? ' on' : '');
+    if (!previewOn) {
+      document.getElementById('preview-ph').style.display = 'flex';
+      document.getElementById('preview').style.display = 'none';
+      document.getElementById('preview-ph').textContent = '미리보기 꺼짐 — 기능 패널에서 켤 수 있음 (macOS 권한 팝업 방지)';
+    }
     document.getElementById('approve-count').textContent = d.approve_count + '회';
     document.getElementById('cont-count').textContent = d.continuation_count + '회';
     document.getElementById('stall-count').textContent = (d.stall_count || 0) + '회';
@@ -2155,7 +2193,7 @@ function esc(s) {
 }
 
 async function updatePreview() {
-  if (!selRegion) return;
+  if (!selRegion || !previewOn) return;
   try {
     const d = await (await fetch('/api/preview')).json();
     if (d.image) {
@@ -2186,6 +2224,11 @@ async function toggleCont() {
 async function toggleStallGit() {
   stallGitOn = !stallGitOn;
   await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stall_git:stallGitOn})});
+}
+
+async function togglePreview() {
+  previewOn = !previewOn;
+  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preview_enabled:previewOn})});
 }
 
 // ── 세션 관리 ──────────────────────────────────────────────────────
@@ -2689,9 +2732,8 @@ def main():
     if not _cmux_inside and os.path.exists(CMUX_SOCK):
         print("⚠️  cmux 외부에서 실행 중 — cmux 탭에서 실행하면 세션 모니터링 가능")
 
-    _, ok = osascript('tell application "System Events" to get name of first process whose frontmost is true')
-    if not ok:
-        print("⚠️  접근성 권한 필요: 시스템 설정 → 개인정보 보호 → 손쉬운 사용 → 터미널 허용")
+    # (구) 시작 시 접근성 권한 osascript 체크 제거 — 재시작마다 호스트 앱(cmux) 이름으로
+    # 자동화 권한 요청 팝업을 유발했음. 키스트로크 폴백은 실제 사용 시점에만 권한 요청됨.
 
     print(f"""
 ╔══════════════════════════════════════════════════╗
