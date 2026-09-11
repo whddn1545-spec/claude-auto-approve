@@ -3,3 +3,6 @@ __pycache__/
 .DS_Store
 settings.json
 .cmux-password
+
+# app.py 백업본
+app.py.bak-*

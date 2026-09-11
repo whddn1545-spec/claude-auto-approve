@@ -184,12 +184,25 @@ run_session() {
   log "▶ $label 세션 시작"
   # --output-format json 은 세션이 끝나야 한 번에 뱉는다. 그동안 로그가 완전히
   # 조용해서 멈춘 것처럼 보이므로, 2분마다 생존 신호를 남긴다.
-  local body rc ticker t0=$SECONDS
-  ( while :; do sleep 120; log "   … $label 진행 중 ($(( (SECONDS - t0) / 60 ))분)"; done ) &
+  #
+  # 잠은 반드시 짧게 끊어서 잔다. 서브셸이 `sleep 120` 안에 있으면 bash 가
+  # 시그널 처리를 그 sleep 이 끝날 때까지 미루기 때문에, kill 을 보내도 죽지 않고
+  # `wait` 가 최대 2분을 통째로 막는다. 세션마다 2분씩 새는 버그였다.
+  local body rc ticker hb="$LOG_DIR/.heartbeat"
+  : > "$hb"
+  (
+    e=0
+    while [ -f "$hb" ]; do
+      sleep 5
+      e=$((e + 5))
+      [ -f "$hb" ] || break
+      [ $((e % 120)) -eq 0 ] && log "   … $label 진행 중 ($((e / 60))분)"
+    done
+  ) &
   ticker=$!
   body="$(printf '%s' "$prompt" | claude "${CLAUDE_ARGS[@]}" 2>&1)"
   rc=$?
-  kill "$ticker" 2>/dev/null; wait "$ticker" 2>/dev/null
+  rm -f "$hb"; wait "$ticker" 2>/dev/null
   printf '%s' "$body" > "$out"
 
   if is_rate_limited "$body"; then
@@ -250,7 +263,7 @@ while [ "$cycle" -le "$MAX_CYCLES" ]; do
   after="$(git rev-parse HEAD)"
   if [ "$DRY" = 0 ]; then
     n="$(git rev-list --count "${before}..${after}" 2>/dev/null || echo 0)"
-    log "📦 이번 사이클 커밋 $n건"
+    log "📦 이번 사이클 커밋 ${n}건"
     if [ "$n" = "0" ]; then
       log "⚠️ 커밋이 하나도 없다. 더 진행해도 같은 상태일 가능성이 높아 중단한다."
       break
@@ -268,7 +281,7 @@ done
 END_COMMIT="$(git rev-parse HEAD)"
 TOTAL="$(git rev-list --count "${START_COMMIT}..${END_COMMIT}" 2>/dev/null || echo 0)"
 log "════════════════════════════════════════════"
-log "총 커밋 $TOTAL건   ${START_COMMIT:0:8} → ${END_COMMIT:0:8}"
+log "총 커밋 ${TOTAL}건   ${START_COMMIT:0:8} → ${END_COMMIT:0:8}"
 log "되돌리려면:  git -C \"$PROJECT\" reset --hard $START_COMMIT"
 log "로그:        $LOG_DIR"
 log "════════════════════════════════════════════"
