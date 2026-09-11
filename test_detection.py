@@ -198,7 +198,21 @@ check("절대시각 7pm 파싱됨(미래)", _abs > time.time(), True)
 check("파싱 불가 시 0", app.parse_reset_epoch('no reset info here'), 0.0)
 
 
-# ─── 7. 자동 git 커밋 (임시 저장소에서 실제 실행) ────────────────────────
+# ─── 7. 커밋 메시지 품질 ─────────────────────────────────────────────────
+section("커밋 메시지로 쓸 수 있는 요약인가")
+# _get_work_summary 는 세션 로그의 마지막 assistant 메시지를 그대로 가져온다.
+# 세션이 에러로 끝나면 그 에러가 커밋 메시지가 되어 원격까지 나간다 (실제 발생).
+check("실제로 푸시됐던 쓰레기 메시지",
+      app._is_usable_summary("You've hit your session limit · resets 8:40pm (Asia/Seoul)"), False)
+check("API 에러", app._is_usable_summary('API Error: rate limit exceeded'), False)
+check("권한 거부", app._is_usable_summary('Permission for this action was denied'), False)
+check("파이썬 트레이스백", app._is_usable_summary('Traceback (most recent call last):'), False)
+check("빈 문자열", app._is_usable_summary(''), False)
+check("너무 짧음", app._is_usable_summary('완료'), False)
+check("정상 요약은 통과", app._is_usable_summary('Phase 2 결제 연동 완료, 테스트 28개 통과'), True)
+
+
+# ─── 8. 자동 git 커밋 (임시 저장소에서 실제 실행) ────────────────────────
 section("자동 git 커밋 · 실제 동작")
 
 
@@ -230,6 +244,11 @@ def run_git_test():
         msg = g('log', '-1', '--pretty=%s').stdout.strip()
         check("커밋 메시지에 [Auto] 접두사", msg.startswith('[Auto]'), True)
         check("워킹 트리 깨끗해짐", g('status', '--porcelain').stdout.strip(), '')
+        # 세션 로그가 없는 임시 저장소이므로 _diff_summary 폴백이 쓰여야 한다.
+        # 여기에 한도 문구가 들어가면 그게 곧 원격에 나가는 사고다.
+        check("메시지에 변경 파일명이 들어감", 'b.txt' in msg, True)
+        check("메시지에 에러 문구 없음",
+              any(p in msg.lower() for p in ('session limit', 'error', 'denied')), False)
 
 
 run_git_test()

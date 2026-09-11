@@ -792,6 +792,40 @@ def _get_work_summary(repo_path: str, max_age_hours: int = 8) -> str:
     return ''
 
 
+def _is_usable_summary(s: str) -> bool:
+    """커밋 메시지로 쓸 만한 요약인지 판별.
+
+    _get_work_summary 는 세션 로그의 마지막 assistant 메시지를 그대로 가져오는데,
+    세션이 에러로 끝났으면 그 에러가 커밋 메시지가 된다. 2026-09-11 에 실제로
+    "[Auto] ... — You've hit your session limit · resets 8:40pm" 커밋이 세 개
+    만들어져 원격까지 푸시됐다.
+    """
+    t = (s or '').strip().lower()
+    if len(t) < 8:
+        return False
+    for p in ("you've hit", 'session limit', 'usage limit', 'rate limit',
+              'quota', 'api error', 'api_error', 'error:', 'traceback',
+              'permission denied', 'was denied'):
+        if p in t:
+            return False
+    return True
+
+
+def _diff_summary(repo_path: str) -> str:
+    """변경된 파일 이름으로 커밋 메시지를 만든다.
+    채팅 텍스트와 달리 엉뚱한 내용이 들어갈 여지가 없다."""
+    try:
+        r = subprocess.run(['git', '-C', repo_path, 'status', '--porcelain'],
+                           capture_output=True, text=True, timeout=10)
+        files = [ln[3:].strip() for ln in r.stdout.splitlines() if ln[3:].strip()]
+    except Exception:
+        files = []
+    if not files:
+        return '자동 저장'
+    head = ', '.join(os.path.basename(f) for f in files[:3])
+    return head if len(files) <= 3 else f'{head} 외 {len(files) - 3}개'
+
+
 # ─── 포트폴리오 자동 생성 ──────────────────────────────────────────────
 def _get_session_context(repo_path: str, max_age_hours: int = 8, max_chars: int = 3000) -> str:
     """해당 레포의 최근 JSONL 세션에서 user/assistant 메시지를 모아 요약 컨텍스트 반환."""
@@ -1189,7 +1223,9 @@ def auto_git_commit_push(repo_path: str):
         if not r.stdout.strip():
             log(f'[git] {repo_path}: 변경사항 없음', 'info')
             return
-        summary = _get_work_summary(repo_path) or '자동 저장'
+        summary = _get_work_summary(repo_path)
+        if not _is_usable_summary(summary):
+            summary = _diff_summary(repo_path)
         from datetime import datetime
         ts = datetime.now().strftime('%Y-%m-%d %H:%M')
         commit_msg = f'[Auto] {ts} — {summary[:120]}'
@@ -1352,8 +1388,12 @@ def monitor_loop():
                         and (now - _cont_last_sent.get(sid, 0)) >= idle_cooldown)
 
                 # 30분 이상 멈춤 감지 (idle 프롬프트 상태 + 내용 unchanged)
+                # cont_on 을 반드시 본다 — '이어서' 를 끈 세션에 멈춤 감지가 대신
+                # 명령을 쏘면 사용자가 끈 의미가 없다. 2026-09-11 에 continuation=false
+                # 로 막아둔 세션에 이 경로로 "개발 계속해줘" 가 들어갔다.
                 stall = (
-                    is_prompt_idle(content)
+                    cont_on
+                    and is_prompt_idle(content)
                     and sid not in _stall_sent
                     and (time.time() - _content_unchanged_since.get(sid, time.time())) > STALL_TIMEOUT
                 )
