@@ -233,6 +233,11 @@ _stall_sent: set = set()
 STALL_TIMEOUT = 30 * 60       # 30분
 IDLE_SEND_TIMEOUT = 10 * 60   # idle 프롬프트 전송 기준: 10분 동안 변화 없을 때
 
+# 한도로 인정하기 전에 화면이 멈춰 있어야 하는 시간.
+# 진짜 한도는 세션을 얼어붙게 하지만, 한도 문구를 인용하는 대화는 화면이 계속
+# 흐른다. 이 조건 하나로 자기참조 오탐을 막는다.
+RATE_CONFIRM_SECONDS = 20
+
 
 # ─── 로그 ─────────────────────────────────────────────────────────────
 def log(msg, level='info'):
@@ -1386,7 +1391,14 @@ def monitor_loop():
                 with state_lock:
                     _auto = state['autonomous_mode']
                     _hit  = state['rate_limit_hit_gemini'] if kind == 'gemini' else state['rate_limit_hit']
-                if (_auto and not _hit
+                # 자기참조 오탐 방어: 화면이 멈춰 있을 때만 진짜 한도로 인정한다.
+                # 한도에 걸리면 세션은 그 자리에서 얼어붙는다. 반면 한도 메시지를
+                # "인용"하는 대화(예: 사람과 한도 얘기를 하는 중)는 화면이 계속
+                # 흐르므로, 안정 시간 조건 하나로 둘을 가른다.
+                # 2026-09-11: 대화 중 한도 문구를 화면에 출력했더니 데몬이 그걸 읽고
+                # 한 시간을 기다렸다가 재개 명령을 쏘는 일이 실제로 있었다.
+                _stable = (time.time() - _content_unchanged_since.get(sid, now)) >= RATE_CONFIRM_SECONDS
+                if (_auto and not _hit and _stable
                         and time.time() > _resume_grace_until[kind]
                         and is_rate_limit(content)):
                     if kind == 'gemini':
