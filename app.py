@@ -190,6 +190,12 @@ RATE_LIMIT_PATTERNS = [
     'hour limit',
     'resets ',
     '시간 후에',
+    # Gemini CLI 전용 한도 메시지 ("Individual quota reached. Please upgrade
+    # your subscription... Resets in 52m50s") — Claude와 토큰이 별개라 따로 감지
+    'individual quota',
+    'quota reached',
+    'upgrade your subscription',
+    'resets in',
 ]
 
 # 픽셀 폴백 전용 쿨다운 (dialog/continuation은 active-state 추적으로 대체)
@@ -411,11 +417,62 @@ def _cmux_rpc(method: str, params: dict, timeout: float = 6.0):
         return 'cmux 접근 거부', False
     return result, ok
 
-_SPINNER = set('✳⠁⠂⠃⠄⠅⠆⠇⠈⠉⠊⠋⠌⠍⠎⠏⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿⡿⢿⣻⣯⣷⣾⣽⣟⣿⣷')
+# Claude Code 스피너 글리프 화이트리스트.
+# 버전마다 바뀐다(점자 → ✳ → 2026-09 현재 ◐◑ 원형). 여기서 놓치면 세션을 통째로
+# 못 보고 시스템 전체가 조용히 죽으므로, 셸 탭 제목('~', '~/path')과 겹치지 않는
+# 기호는 넓게 잡는다. 그래도 놓치는 건 _probe_is_claude() 내용 폴백이 받는다.
+_SPINNER = set(
+    '⠁⠂⠃⠄⠅⠆⠇⠈⠉⠊⠋⠌⠍⠎⠏⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟'
+    '⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿'
+    '⡿⢿⣻⣯⣷⣾⣽⣟⣿⣠⣄⣆⣇⣏⣹⣸⣰⣤⣦⣧'
+    '◐◑◒◓◴◵◶◷◜◝◞◟◠◡'            # 2026-09: 원형 스피너 (U+25D0~)
+    '∗✢✣✤✥✦✧✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁'  # 구버전 sparkle 계열
+)
+
+# Claude Code TUI 화면에만 나타나는 문구 — 제목 글리프가 또 바뀌어도 세션을
+# 놓치지 않기 위한 폴백. 셸이나 이 데몬 자신의 로그에는 등장하지 않는 것만 넣는다.
+_CLAUDE_CONTENT_SIGNS = (
+    '? for shortcuts',
+    'esc to interrupt',
+    'welcome to claude code',
+    'bypassing permissions',
+)
+
+# 데몬이 자기 자신의 탭을 조종하는 사고 방지
+_SELF_TITLE_MARKS = ('오토어프로브', 'auto-approve', 'autoprobe')
+
+_probe_cache: dict = {}   # ref -> (검사시각, 판정)
+PROBE_TTL = 300.0
+
 
 def _is_claude_title(title: str) -> bool:
     """Claude Code 세션 제목인지 판별 (스피너 문자로 시작)"""
     return bool(title) and title[0] in _SPINNER
+
+
+def _looks_like_claude_content(text: str) -> bool:
+    t = text[-2000:].lower()
+    return any(s in t for s in _CLAUDE_CONTENT_SIGNS)
+
+
+def _probe_is_claude(ref: str) -> bool:
+    """제목으로 판별 실패한 surface의 화면을 한 번 읽어 Claude 세션인지 확인 (5분 캐시).
+    신규 세션에 대해서만 호출되므로 매 틱 비용이 아니다."""
+    now = time.time()
+    hit = _probe_cache.get(ref)
+    if hit and now - hit[0] < PROBE_TTL:
+        return hit[1]
+    result, ok = _cmux_rpc('surface.read_text',
+                           {'surface_id': ref, 'lines': 40, 'scrollback': False})
+    val = False
+    if ok:
+        try:
+            raw = base64.b64decode(result.get('base64', '')).decode('utf-8', errors='replace')
+            val = _looks_like_claude_content(raw)
+        except Exception:
+            val = False
+    _probe_cache[ref] = (now, val)
+    return val
 
 def get_cmux_surfaces():
     """cmux tree에서 모든 terminal surface 정보 반환 → [{'ref','title','type'}]"""
@@ -437,14 +494,31 @@ def get_cmux_surfaces():
     return surfaces
 
 def _apply_session_defaults(surfaces):
-    """신규 세션에 스마트 기본값 적용 (Claude 스피너 → True, 일반 shell → False)"""
+    """신규 세션에 스마트 기본값 적용 (Claude 스피너/화면 시그니처 → True, 일반 shell → False)"""
+    # 신규 판정은 락 밖에서 먼저 끝낸다 — _probe_is_claude()가 RPC를 타므로
+    # state_lock을 쥔 채 호출하면 모니터 루프 전체가 블로킹된다.
+    with state_lock:
+        known = set(state['session_config'])
+    verdicts = {}
+    for s in surfaces:
+        sid = f'cmux:{s["ref"]}'
+        if sid in known:
+            continue
+        title = s.get('title') or ''
+        if any(m in title.lower() for m in _SELF_TITLE_MARKS):
+            verdicts[sid] = False          # 데몬 자기 탭은 절대 조종하지 않는다
+        elif _is_claude_title(title):
+            verdicts[sid] = True
+        else:
+            verdicts[sid] = _probe_is_claude(s['ref'])
+
     with state_lock:
         cfg = state['session_config']
         changed = False
         for s in surfaces:
             sid = f'cmux:{s["ref"]}'
             if sid not in cfg:
-                is_claude = _is_claude_title(s['title'])
+                is_claude = verdicts.get(sid, _is_claude_title(s['title']))
                 cfg[sid] = {'approve': is_claude, 'continuation': is_claude, 'title': s['title']}
                 changed = True
             else:
@@ -455,6 +529,10 @@ def _apply_session_defaults(surfaces):
         for dead_sid in [k for k in cfg if k.startswith('cmux:') and k not in live]:
             del cfg[dead_sid]
             changed = True
+        # 프로브 캐시도 함께 GC — surface ref는 재사용되므로 남겨두면 오판정 위험
+        live_refs = {s['ref'] for s in surfaces}
+        for dead_ref in [r for r in _probe_cache if r not in live_refs]:
+            _probe_cache.pop(dead_ref, None)
         return changed
 
 def get_cmux_sessions():
@@ -551,14 +629,28 @@ def _session_kind(text: str) -> str:
     """세션이 Gemini(Antigravity)인지 Claude인지 판별.
     토큰/한도가 서로 별개라 rate-limit 쿨다운을 종류별로 따로 추적하기 위함."""
     lines = text.strip().splitlines()
-    recent = '\n'.join(lines[-6:])
-    return 'gemini' if 'gemini' in recent.lower() else 'claude'
+    recent = '\n'.join(lines[-6:]).lower()
+    # Gemini CLI 한도 메시지엔 'gemini' 단어가 없을 수 있으므로 전용 시그니처도 확인
+    # (없으면 Gemini 한도가 Claude로 오분류돼 Claude를 잘못 대기시킴)
+    if 'gemini' in recent or 'individual quota' in recent or 'upgrade your subscription' in recent:
+        return 'gemini'
+    return 'claude'
 
 
 def parse_reset_epoch(text: str) -> float:
-    """'resets 1am' / 'resets 7:20pm (Asia/Seoul)' 에서 리셋 epoch 추출. 실패 시 0."""
+    """'resets 1am' / 'resets 7:20pm (Asia/Seoul)' / 'Resets in 52m50s'(Gemini CLI)
+    에서 리셋 epoch 추출. 실패 시 0."""
     import re
     from datetime import datetime, timedelta
+    # 상대 시간 우선 처리 — Gemini CLI: "Resets in 52m50s" / "Resets in 1h 5m" / "in 30s"
+    rel = re.search(
+        r'resets?\s+in\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?',
+        text, re.IGNORECASE)
+    if rel and any(rel.groups()):
+        h, mn, s = (int(g) if g else 0 for g in rel.groups())
+        total = h * 3600 + mn * 60 + s
+        if total > 0:
+            return time.time() + total
     # 분(minute)을 선택적으로 처리 — "resets 1am"(분 없음)도 매칭
     m = re.search(r'resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', text, re.IGNORECASE)
     if not m:
