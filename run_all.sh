@@ -42,6 +42,26 @@ done
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "❌ git 저장소가 아니다."; exit 1; }
 command -v claude >/dev/null 2>&1 || { echo "❌ claude CLI를 찾을 수 없다."; exit 1; }
 
+# 사이클마다 작업 브랜치를 파고 게이트를 통과해야 여기로 머지한다.
+BASE_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+[ "$BASE_BRANCH" = "HEAD" ] && { echo "❌ detached HEAD 상태다. 브랜치를 먼저 체크아웃해라."; exit 1; }
+case "$BASE_BRANCH" in
+  autorun/*) echo "❌ 작업 브랜치($BASE_BRANCH) 위에서는 돌리지 않는다. 본 브랜치로 옮겨라."; exit 1 ;;
+esac
+# 커밋 안 된 변경이 있으면 브랜치를 오가며 섞인다. 먼저 정리하게 한다.
+# 단 .autorun/ 은 이 스크립트가 만드는 로그라 제외한다 — 안 그러면 두 번째
+# 실행부터 자기 로그를 보고 "더럽다"며 거부한다.
+DIRTY="$(git status --porcelain | grep -v '^?? \.autorun/' || true)"
+if [ -n "$DIRTY" ]; then
+  echo "❌ 커밋되지 않은 변경이 있다. 먼저 커밋하거나 stash 해라:"
+  printf '%s\n' "$DIRTY" | head -10
+  exit 1
+fi
+# 로그가 커밋에 섞여 들어가지 않게 한 번만 알려준다.
+if ! grep -qx '\.autorun/' .gitignore 2>/dev/null; then
+  echo "ℹ️  .gitignore 에 '.autorun/' 를 추가해두면 실행 로그가 커밋에 섞이지 않는다."
+fi
+
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 LOG_DIR="$PROJECT/.autorun/$RUN_ID"
 mkdir -p "$LOG_DIR"
@@ -257,17 +277,52 @@ while [ "$cycle" -le "$MAX_CYCLES" ]; do
   log "──────── 사이클 $cycle/$MAX_CYCLES ────────"
   before="$(git rev-parse HEAD)"
 
-  run_with_backoff "cycle${cycle}-build" "$BUILD_PROMPT" || { log "루프 중단 (빌드 실패)"; break; }
-  run_with_backoff "cycle${cycle}-review" "$REVIEW_PROMPT" || { log "루프 중단 (리뷰 실패)"; break; }
+  # 작업 브랜치에서 빌드·리뷰를 하고, 게이트를 통과했을 때만 본 브랜치로 머지한다.
+  # 이렇게 해야 "리뷰를 통과한 결과만 커밋된다"가 말 그대로 성립한다.
+  # (본 브랜치는 리뷰 통과분만 담고, 실패한 시도는 브랜치에 남아 그대로 볼 수 있다)
+  WORK_BRANCH="autorun/${RUN_ID}-c${cycle}"
+  if [ "$DRY" = 0 ]; then
+    git checkout -q -b "$WORK_BRANCH" || { log "❌ 작업 브랜치 생성 실패"; break; }
+    log "🌿 작업 브랜치 $WORK_BRANCH"
+  fi
+
+  build_ok=1
+  run_with_backoff "cycle${cycle}-build"  "$BUILD_PROMPT"  || { log "루프 중단 (빌드 실패)"; build_ok=0; }
+  [ "$build_ok" = 1 ] && { run_with_backoff "cycle${cycle}-review" "$REVIEW_PROMPT" || { log "루프 중단 (리뷰 실패)"; build_ok=0; }; }
+
+  if [ "$DRY" = 1 ]; then
+    cycle=$((cycle+1)); continue
+  fi
 
   after="$(git rev-parse HEAD)"
-  if [ "$DRY" = 0 ]; then
-    n="$(git rev-list --count "${before}..${after}" 2>/dev/null || echo 0)"
-    log "📦 이번 사이클 커밋 ${n}건"
-    if [ "$n" = "0" ]; then
-      log "⚠️ 커밋이 하나도 없다. 더 진행해도 같은 상태일 가능성이 높아 중단한다."
+  n="$(git rev-list --count "${before}..${after}" 2>/dev/null || echo 0)"
+  log "📦 이번 사이클 커밋 ${n}건 (작업 브랜치)"
+
+  # 게이트 판정: 리뷰 세션이 실패를 선언하면 META_PROMPT §3 대로
+  # PROGRESS.md 최상단에 ⚠️ FAILING 을 남긴다. 그게 곧 머지 거부 신호다.
+  gate_ok=1
+  [ "$build_ok" = 0 ] && gate_ok=0
+  if head -5 PROGRESS.md 2>/dev/null | grep -q 'FAILING'; then
+    log "🚫 리뷰가 FAILING 을 남겼다 — 머지하지 않는다"
+    gate_ok=0
+  fi
+  [ "$n" = "0" ] && { log "⚠️ 커밋이 하나도 없다"; gate_ok=0; }
+
+  git checkout -q "$BASE_BRANCH" || { log "❌ $BASE_BRANCH 로 못 돌아감"; break; }
+
+  if [ "$gate_ok" = 1 ]; then
+    if git merge -q --no-ff "$WORK_BRANCH" -m "리뷰 통과: 사이클 ${cycle} (${n}커밋)"; then
+      log "✅ 게이트 통과 → $BASE_BRANCH 에 머지"
+      git branch -q -d "$WORK_BRANCH" 2>/dev/null
+    else
+      log "❌ 머지 실패 — 작업은 $WORK_BRANCH 에 남아 있다"
+      git merge --abort 2>/dev/null
       break
     fi
+  else
+    log "⛔ 게이트 미통과 — $BASE_BRANCH 는 그대로 두고 중단한다"
+    log "   확인:  git -C \"$PROJECT\" checkout $WORK_BRANCH"
+    break
   fi
 
   if all_done; then

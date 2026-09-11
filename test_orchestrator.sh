@@ -32,9 +32,14 @@ if [ -n "\${FAKE_RATELIMIT:-}" ] && [ "\$N" -le "\$FAKE_RATELIMIT" ]; then
 fi
 
 if printf '%s' "\$P" | grep -q "시니어 리뷰어"; then
-  echo "- G1 테스트 통과 / G4 '하' 없음 (턴 \$N)" >> "\$R/PROGRESS.md"
+  if [ -n "\${FAKE_FAILING:-}" ]; then
+    # META_PROMPT §3: 게이트를 통과 못 하면 PROGRESS.md 최상단에 ⚠️ FAILING
+    printf '⚠️ FAILING — 테스트 3건 실패\n%s\n' "\$(cat "\$R/PROGRESS.md")" > "\$R/P.t" && mv "\$R/P.t" "\$R/PROGRESS.md"
+  else
+    echo "- G1 테스트 통과 / G4 '하' 없음 (턴 \$N)" >> "\$R/PROGRESS.md"
+  fi
   git -C "\$R" add -A >/dev/null 2>&1
-  git -C "\$R" commit -qm "리뷰: 게이트 5종 통과 (턴 \$N)" >/dev/null 2>&1
+  git -C "\$R" commit -qm "리뷰: 게이트 검사 (턴 \$N)" >/dev/null 2>&1
   echo '{"type":"result","is_error":false,"result":"리뷰 완료"}'
 else
   echo "work \$N" > "\$R/feature_\$N.txt"
@@ -56,6 +61,7 @@ reset_proj() {
   git config user.email t@local; git config user.name test; git config commit.gpgsign false
   for f in META_PROMPT.md TODO.md TASTE.md CLAUDE.md; do echo "# $f" > "$f"; done
   echo "# PROGRESS" > PROGRESS.md
+  printf '.autorun/\n' > .gitignore
   git add -A && git commit -qm init >/dev/null
 }
 
@@ -94,11 +100,45 @@ OUT="$(FAKE_RATELIMIT=2 bash "$RUNNER" "$PROJ" --once 2>&1)"
 grep -q "32초 대기 후 재시도"  <<<"$OUT"; check "리셋 시각을 읽어 32초만 기다렸다" $?
 grep -q "cycle1-review 세션 시작" <<<"$OUT"; check "재개 후 리뷰까지 완주했다" $?
 
+# ─── E. 게이트 — 통과분만 본 브랜치에 들어간다 ──────────────────────────
+echo; echo "── E. 리뷰 게이트 (통과분만 커밋)"
+reset_proj
+BASE_BEFORE="$(git -C "$PROJ" rev-parse HEAD)"
+OUT="$(bash "$RUNNER" "$PROJ" --once 2>&1)"
+grep -q "작업 브랜치 autorun/" <<<"$OUT";            check "작업 브랜치에서 작업했다" $?
+grep -q "게이트 통과 → .* 머지" <<<"$OUT";           check "통과 시 본 브랜치로 머지" $?
+[ "$(git -C "$PROJ" rev-parse HEAD)" != "$BASE_BEFORE" ]; check "본 브랜치가 전진했다" $?
+git -C "$PROJ" log -1 --pretty=%s | grep -q "리뷰 통과"; check "머지 커밋이 통과를 표시한다" $?
+
+# 리뷰가 FAILING 을 남기면 본 브랜치는 건드리지 않아야 한다
+reset_proj
+BASE_BEFORE="$(git -C "$PROJ" rev-parse HEAD)"
+OUT="$(FAKE_FAILING=1 bash "$RUNNER" "$PROJ" --once 2>&1)"
+grep -q "FAILING 을 남겼다" <<<"$OUT";               check "FAILING 을 감지했다" $?
+grep -q "게이트 미통과" <<<"$OUT";                    check "머지를 거부했다" $?
+[ "$(git -C "$PROJ" rev-parse HEAD)" = "$BASE_BEFORE" ]; check "본 브랜치가 그대로다" $?
+git -C "$PROJ" branch --list 'autorun/*' | grep -q autorun; check "실패한 작업이 브랜치에 남아 있다" $?
+
 # ─── D. 가드 ────────────────────────────────────────────────────────────
 echo; echo "── D. 가드"
+reset_proj
 bash "$RUNNER" >/dev/null 2>&1;                     [ $? -ne 0 ]; check "인자 없으면 거부" $?
 bash "$RUNNER" "$TMP" >/dev/null 2>&1;              [ $? -ne 0 ]; check "맥락 파일 없으면 거부" $?
 MAX_ITEMS=abc bash "$RUNNER" "$PROJ" >/dev/null 2>&1; [ $? -ne 0 ]; check "MAX_ITEMS 숫자 아니면 거부" $?
+
+# 커밋 안 된 변경이 있으면 브랜치를 오가며 섞이므로 거부해야 한다
+echo "미커밋" > "$PROJ/dirty.txt"
+bash "$RUNNER" "$PROJ" >/dev/null 2>&1;             [ $? -ne 0 ]; check "더러운 워킹트리 거부" $?
+rm -f "$PROJ/dirty.txt"
+
+# 자기 로그(.autorun/)는 더럽다고 보면 안 된다 — 두 번째 실행이 막힌다
+mkdir -p "$PROJ/.autorun/x" && echo log > "$PROJ/.autorun/x/run.log"
+OUT="$(bash "$RUNNER" "$PROJ" --once 2>&1)"
+grep -q "커밋되지 않은 변경" <<<"$OUT"; [ $? -ne 0 ]; check ".autorun/ 은 더럽다고 보지 않는다" $?
+
+# 작업 브랜치 위에서는 돌리지 않는다
+git -C "$PROJ" checkout -q -b autorun/manual-test
+bash "$RUNNER" "$PROJ" >/dev/null 2>&1;             [ $? -ne 0 ]; check "autorun 브랜치 위에서 거부" $?
 
 echo
 echo "══════════════════════════════════════════"
