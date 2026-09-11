@@ -20,6 +20,7 @@ Claude Auto-Approve v1.4
 
 import json
 import os
+import re
 import signal
 import socket
 import threading
@@ -431,12 +432,22 @@ _SPINNER = set(
 
 # Claude Code TUI 화면에만 나타나는 문구 — 제목 글리프가 또 바뀌어도 세션을
 # 놓치지 않기 위한 폴백. 셸이나 이 데몬 자신의 로그에는 등장하지 않는 것만 넣는다.
+# 주의: '? for shortcuts' 는 2026-09 기준 화면에서 사라졌고 상태줄이
+#       '⏵⏵ auto mode on (shift+tab to cycle) · ← for agents' 로 바뀌었다.
+#       구버전 대응으로 남겨두되, 현행 문구를 앞에 둔다. (test_detection.py 가 지킨다)
 _CLAUDE_CONTENT_SIGNS = (
-    '? for shortcuts',
+    'auto mode on',
+    'shift+tab to cycle',
+    'for agents',
+    'do you want to proceed',
     'esc to interrupt',
+    '? for shortcuts',
     'welcome to claude code',
     'bypassing permissions',
 )
+
+# "작업 중" 표시 — 스피너 줄에 경과시간이 붙는다: "✽ Unravelling… (59s · ↓ 2.8k tokens)"
+_BUSY_ELAPSED = re.compile(r'\((?:\d+m\s*)?\d+s\b')
 
 # 데몬이 자기 자신의 탭을 조종하는 사고 방지
 _SELF_TITLE_MARKS = ('오토어프로브', 'auto-approve', 'autoprobe')
@@ -597,11 +608,32 @@ def is_feedback_survey(text: str) -> bool:
     return 'how is claude doing' in t and 'dismiss' in t
 
 
+def _looks_busy(text: str) -> bool:
+    """Claude가 지금 작업 중인지 판별.
+
+    작업 중에도 입력창(❯)은 비어 있으므로, ❯ 만 보고 idle 로 판단하면 열심히
+    일하는 세션에 "이어서 진행해줘"를 쏘게 된다. 스피너 줄의 경과시간 표기
+    ("✽ Unravelling… (59s · ↓ 2.8k tokens)")로 작업 중임을 구분한다.
+    """
+    lines = text.strip().splitlines()[-10:]
+    for line in lines:
+        low = line.lower()
+        if 'esc to interrupt' in low:
+            return True
+        s = line.strip()
+        if s and s[0] in _SPINNER and _BUSY_ELAPSED.search(s):
+            return True
+    return False
+
+
 def is_prompt_idle(text: str) -> bool:
     """Claude Code 입력 대기 프롬프트 감지 — 완료 후 대기 중인 경우"""
+    # 작업 중이면 입력창이 비어 있어도 대기가 아니다
+    if _looks_busy(text):
+        return False
     lines = text.strip().splitlines()
     tail = '\n'.join(lines[-8:]).lower()
-    # '? for shortcuts' 는 Claude 입력 대기 중에만 표시됨 → 가장 신뢰할 수 있는 idle 지표
+    # '? for shortcuts' 는 Claude 입력 대기 중에만 표시됨 → 구버전의 신뢰 지표
     if '? for shortcuts' in tail:
         return True
     # 폴백: ❯ 단독 라인 (다이얼로그 등 오탐 방지용 기존 체크)
