@@ -1,5 +1,10 @@
 #!/bin/bash
 cd "$(dirname "$0")"
+# Pillow가 설치된 Python을 고른다 (Homebrew 기본 python3가 올라가면 Pillow가 없어 앱이 바로 죽음)
+PY=python3
+for c in /opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 python3; do
+    if "$c" -c "import PIL" &>/dev/null; then PY="$c"; break; fi
+done
 
 # 이미 실행 중이면 종료 (LISTEN 소켓만 검사)
 if lsof -nP -iTCP:17654 -sTCP:LISTEN -t &>/dev/null; then
@@ -9,7 +14,7 @@ fi
 
 # cmux 내부에서 실행 중 → 바로 시작
 if [ -n "$CMUX_SURFACE_ID" ]; then
-    exec python3 app.py
+    exec "$PY" app.py
 fi
 
 # cmux CLI 경로: PATH 우선, 없으면 번들 경로
@@ -21,7 +26,7 @@ if [ -x "$CMUX_BIN" ]; then
     SURF=$("$CMUX_BIN" new-surface 2>/dev/null | grep -oE 'surface:[0-9]+')
     if [ -n "$SURF" ]; then
         "$CMUX_BIN" rename-tab --surface "$SURF" "클로드 오토어프로브" 2>/dev/null
-        "$CMUX_BIN" send --surface "$SURF" "cd ~/claude-auto-approve && exec python3 app.py"
+        "$CMUX_BIN" send --surface "$SURF" "cd ~/claude-auto-approve && exec $PY app.py"
         "$CMUX_BIN" send-key --surface "$SURF" enter
         echo "✅ cmux 탭에서 시작됨 (surface: $SURF)"
         exit 0
@@ -30,4 +35,4 @@ fi
 
 # 폴백: 직접 실행 (cmux 세션 감지 불가)
 echo "⚠️  cmux 외부에서 실행 중 — cmux 세션 감지 불가"
-exec python3 app.py
+exec "$PY" app.py
